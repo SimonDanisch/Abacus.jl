@@ -10,6 +10,11 @@ GPUCompiler.method_table(::AbacusCompilerJob) = method_table
 
 GPUCompiler.kernel_state_type(job::AbacusCompilerJob) = KernelState
 
+# Don't add byval attributes to bittype args — keep Julia's native calling convention.
+# add_kernel_state! still adds KernelState as first arg by value; kernel_state_to_reference!
+# then converts it to a pointer so ccall can pass Ptr{KernelState} directly.
+GPUCompiler.pass_by_value(::AbacusCompilerJob) = false
+
 # Allow gpu_malloc/gpu_free, libc malloc/free, and Julia runtime functions
 # that appear in error paths but won't actually be reached at runtime.
 # We execute natively on the host CPU so these are all safe.
@@ -22,30 +27,59 @@ const _allowed_intrinsics = Set([
     "ijl_string_to_string", "jl_string_to_string",
     "ijl_symbol_name", "jl_symbol_name",
     "memcpy", "memset", "memmove",
-    # Thread ID for per-thread kernel state access
-    "jl_threadid", "ijl_threadid",
 ])
 GPUCompiler.isintrinsic(::AbacusCompilerJob, fn::String) = fn in _allowed_intrinsics
 
-# GPU-strict IR validation — copied from Metal.jl's validate_ir.
-# The default check_ir → check_ir! pipeline already catches dynamic dispatch,
-# runtime calls, GC allocations, and error paths. We add Float64 and i128 rejection.
+# Strict Metal-compatible IR validation.
+#
+# This is an exact copy of Metal's validate_ir (GPUCompiler/src/metal.jl) so that Abacus
+# rejects the exact same IR constructs that Metal would reject. The design goal of Abacus
+# is to serve as a drop-in CPU backend that catches Metal-incompatible code on non-macOS
+# machines, enabling local testing of GPU kernels before running them on Apple hardware.
+#
+# Checked: Float64 (double), except values used exclusively in metal_os_log calls.
+#          Int128 (i128), unconditionally.
 function GPUCompiler.validate_ir(job::AbacusCompilerJob, mod::LLVM.Module)
     errors = GPUCompiler.IRError[]
 
-    # reject Float64 values (same as Metal)
+    # Metal does not support double precision, except for logging
     function is_illegal_double(val)
         T_bad = LLVM.DoubleType()
         if LLVM.value_type(val) != T_bad
+            return false
+        end
+        function used_for_logging(use::LLVM.Use)
+            usr = LLVM.user(use)
+            if usr isa LLVM.CallInst
+                callee = LLVM.called_operand(usr)
+                if callee isa LLVM.Function && startswith(LLVM.name(callee), "metal_os_log")
+                    return true
+                end
+            end
+            return false
+        end
+        if all(used_for_logging, LLVM.uses(val))
             return false
         end
         return true
     end
     append!(errors, GPUCompiler.check_ir_values(mod, is_illegal_double, "use of double value"))
 
-    # Note: i128 is NOT checked in IR — Metal doesn't do this either.
-    # i128 rejection happens at array construction (check_eltype).
-    # Some valid patterns (e.g. _mul_high via llvmcall) use i128 as an intermediate.
+    # Metal never supports 128-bit integers
+    append!(errors, GPUCompiler.check_ir_values(mod, LLVM.IntType(128)))
+
+    # Run LLVM's built-in verifier on the post-optimization IR.
+    # This catches broken IR that optimization passes can produce — e.g. a `select` on a
+    # struct type that an LLVM scalarization pass incorrectly transforms into a
+    # type-mismatched scalar `select` (the verifier diagnoses "Select values must have
+    # same type as select instruction"). Without this, such broken IR silently passes
+    # Abacus's LLJIT (which is more permissive) but crashes Metal's `air` or SPIR-V's
+    # `llc` with an opaque "Broken function found, compilation aborted" message.
+    try
+        LLVM.verify(mod)
+    catch e
+        push!(errors, ("broken LLVM IR after optimization ($(e.info))", [], nothing))
+    end
 
     return errors
 end
@@ -70,60 +104,129 @@ function compiler_config(; kwargs...)
     end
     return config
 end
-@noinline function _compiler_config(; kernel=false, name=nothing, always_inline=true, kwargs...)
+@noinline function _compiler_config(; kernel=true, name=nothing, always_inline=true, kwargs...)
     # NativeCompilerTarget with jlruntime=false enforces GPU constraints:
-    # no GC, no dynamic dispatch, no runtime calls
+    # no GC, no dynamic dispatch, no runtime calls.
+    # kernel=true enables the kernel state mechanism (KernelState as first arg).
     target = NativeCompilerTarget(; jlruntime=false)
     params = AbacusCompilerParams()
     CompilerConfig(target, params; kernel, name, always_inline)
 end
 
-# temp directory for compiled shared libraries (persists for session lifetime)
-const _sodir = Ref{String}("")
-function sodir()
-    if isempty(_sodir[])
-        _sodir[] = mktempdir(; cleanup=true)
+# Global LLJIT instance (session lifetime) for in-process kernel JIT execution.
+const _lljit = Ref{Any}(nothing)
+const _lljit_lock = ReentrantLock()
+
+function _get_or_create_lljit()
+    Base.@lock _lljit_lock begin
+        if _lljit[] === nothing
+            jit = LLVM.LLJIT(; tm=LLVM.JITTargetMachine())
+            jd = LLVM.JITDylib(jit)
+            # Resolve symbols from the host process (malloc, free, etc.)
+            prefix = Sys.isapple() ? '_' : '\0'
+            gen = LLVM.CreateDynamicLibrarySearchGeneratorForProcess(prefix)
+            LLVM.add!(jd, gen)
+
+            # On Windows/MinGW, GPUCompiler strips probe-stack="inline-asm" so LLJIT's
+            # codegen emits calls to ___chkstk_ms (from static libgcc.a) for large frames.
+            # That symbol isn't in any DLL, but ntdll __chkstk has identical semantics:
+            # both take the frame size in %rax, probe stack pages, and leave %rsp unchanged.
+            # Register ntdll's __chkstk under the name ___chkstk_ms so LLJIT can link it.
+            if Sys.iswindows()
+                ntdll = Libdl.dlopen("ntdll.dll"; throw_error=false)
+                if ntdll !== nothing
+                    ptr = Libdl.dlsym(ntdll, "__chkstk"; throw_error=false)
+                    if ptr !== nothing
+                        sym = LLVM.mangle(jit, "___chkstk_ms")
+                        pair = LLVM.API.LLVMOrcCSymbolMapPair(
+                            sym.ref,
+                            LLVM.API.LLVMJITEvaluatedSymbol(
+                                reinterpret(UInt64, ptr),
+                                LLVM.API.LLVMJITSymbolFlags(
+                                    UInt8(LLVM.API.LLVMJITSymbolGenericFlagsExported |
+                                          LLVM.API.LLVMJITSymbolGenericFlagsCallable),
+                                    UInt8(0)
+                                )
+                            )
+                        )
+                        mu = LLVM.absolute_symbols([pair])
+                        LLVM.define(jd, mu)
+                    end
+                end
+            end
+
+            _lljit[] = jit
+        end
+        return _lljit[]::LLVM.LLJIT
     end
-    return _sodir[]
 end
 
-# compile to LLVM IR → validate → emit PIC object code
+# compile: LLVM IR → optimize → convert state arg to pointer → serialize to bitcode.
+# kernel_state_to_reference! wraps the entry function so the KernelState is received
+# as a ptr (loaded on entry) instead of by value, matching ccall's Ptr{KernelState}.
 function compile(@nospecialize(job::CompilerJob))
     JuliaContext() do ctx
         mod, meta = GPUCompiler.compile(:llvm, job)
-        entry = LLVM.name(meta.entry)
+        entry_fn = LLVM.name(meta.entry)
 
-        # strip debug info
         if job.config.strip
             LLVM.strip_debuginfo!(mod)
         end
         GPUCompiler.prepare_execution!(job, mod)
 
-        # emit object code with PIC relocation (required for shared libraries)
-        triple = LLVM.triple(mod)
-        t = LLVM.Target(triple=triple)
-        tm = LLVM.TargetMachine(t, triple;
-            reloc=LLVM.API.LLVMRelocPIC)
-        obj = String(LLVM.emit(tm, mod, LLVM.API.LLVMObjectFile))
+        # Convert kernel state arg from pass-by-value to pass-by-reference.
+        # add_kernel_state! adds KernelState as { i32×6 } by value; on x64 this would
+        # require special ABI handling. Converting to a pointer lets ccall pass
+        # Ptr{KernelState} transparently on all platforms.
+        if job.config.kernel && GPUCompiler.kernel_state_type(job) !== Nothing
+            if haskey(LLVM.functions(mod), entry_fn)
+                entry_f = LLVM.functions(mod)[entry_fn]
+                GPUCompiler.kernel_state_to_reference!(job, mod, entry_f)
+                # kernel_state_to_reference! preserves the function name
+            end
+        end
 
-        (; obj, entry)
+        # Final sanity check: verify IR correctness after all Abacus-specific
+        # transformations (prepare_execution! + kernel_state_to_reference!).
+        LLVM.verify(mod)
+
+        bitcode = convert(Vector{UInt8}, mod)
+        (; bitcode, entry=entry_fn)
     end
 end
 
-# link: write .o → cc -shared → .so → dlopen → dlsym → Ptr{Cvoid}
+# link: parse bitcode → align triple/datalayout to LLJIT → add to LLJIT → return fptr
 function link(@nospecialize(job::CompilerJob), compiled)
-    dir = sodir()
-    id = string(hash(compiled.entry); base=16)
-    obj_path = joinpath(dir, "$(id).o")
-    lib_path = joinpath(dir, "$(id).$(Libdl.dlext)")
+    jit = _get_or_create_lljit()
+    jd = LLVM.JITDylib(jit)
 
-    open(obj_path, "w") do io
-        write(io, compiled.obj)
+    # Check if the symbol is already loaded (e.g. same kernel compiled again after a
+    # REPL method redefinition creates a new MethodInstance cache miss). Compilation is
+    # deterministic for the same (specTypes, config), so reuse the existing definition.
+    try
+        addr = LLVM.lookup(jit, compiled.entry)
+        fptr = LLVM.pointer(addr)
+        fptr != C_NULL && return fptr
+    catch
     end
-    run(`$(LLD_jll.lld_path) -flavor gnu -shared -o $lib_path $obj_path`)
 
-    handle = Libdl.dlopen(lib_path)
-    fptr = Libdl.dlsym(handle, compiled.entry)
-    @assert fptr != C_NULL "Failed to find symbol $(compiled.entry) in $lib_path"
+    JuliaContext() do ctx
+        mod = parse(LLVM.Module, compiled.bitcode)
+        # Align module triple and data layout with the LLJIT target.
+        LLVM.triple!(mod, LLVM.triple(jit))
+        LLVM.datalayout!(mod, LLVM.datalayout(jit))
+        LLVM.add!(jit, jd, LLVM.ThreadSafeModule(mod))
+    end
+
+    addr = LLVM.lookup(jit, compiled.entry)
+    fptr = LLVM.pointer(addr)
+    @assert fptr != C_NULL "Failed to find symbol $(compiled.entry)"
     return fptr
 end
+
+
+# _compile_cached is the compiler function passed to GPUCompiler.cached_compilation.
+# GPUCompiler's built-in disk cache does not work for runtime (non-precompiled) kernels
+# because Base.object_build_id returns nothing for them. We simply delegate to compile,
+# and rely on GPUCompiler's in-memory cache (keyed by CodeInstance) for the session.
+_compile_cached(@nospecialize(job::CompilerJob)) = compile(job)

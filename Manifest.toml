@@ -2,10 +2,10 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "f8e7edb5c6730eaf5b2fd929936b9e74dee7e064"
+project_hash = "c11212048f049fbaaf693dc0d3a3b44b1b137d8d"
 
 [[deps.Abacus]]
-deps = ["AcceleratedKernels", "Adapt", "ExprTools", "GPUArrays", "GPUArraysCore", "GPUCompiler", "JLD2", "KernelAbstractions", "LLD_jll", "LLVM", "Libdl", "LinearAlgebra", "Random", "StaticArrays"]
+deps = ["AcceleratedKernels", "Adapt", "ExprTools", "GPUArrays", "GPUArraysCore", "GPUCompiler", "JLD2", "KernelAbstractions", "LLD_jll", "LLVM", "Libdl", "LinearAlgebra", "Random", "Serialization", "StaticArrays"]
 path = "."
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 version = "0.1.0"

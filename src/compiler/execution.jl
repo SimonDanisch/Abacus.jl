@@ -173,7 +173,7 @@ function abacusfunction(f::F, tt::TT=Tuple{}; name=nothing, kwargs...) where {F,
         cache = compiler_cache()
         source = methodinstance(F, tt)
         config = compiler_config(; name, kwargs...)::AbacusCompilerConfig
-        fptr = GPUCompiler.cached_compilation(cache, source, config, compile, link)
+        fptr = GPUCompiler.cached_compilation(cache, source, config, _compile_cached, link)
 
         h = hash(fptr, hash(f, hash(tt)))
         kernel = get(_kernel_instances, h, nothing)
@@ -205,8 +205,10 @@ function (kernel::HostKernel{F,TT})(args...; groups=1, threads=1) where {F,TT}
 
     converted_args = map(abacusconvert, args)
 
-    # Full tuple type: function type + arg types (abi_call skips ghost types)
-    full_tt = Tuple{F, TT.parameters...}
+    # KernelState is the first argument of every compiled kernel (added by add_kernel_state!
+    # and converted to a pointer by kernel_state_to_reference!). abi_call maps it to
+    # Ptr{KernelState} + Ref(ks), matching the ptr parameter in the compiled function.
+    full_tt = Tuple{KernelState, F, TT.parameters...}
 
     total_groups = groups[1] * groups[2] * groups[3]
 
@@ -215,9 +217,10 @@ function (kernel::HostKernel{F,TT})(args...; groups=1, threads=1) where {F,TT}
         gy = (((group_linear - 1) ÷ groups[1]) % groups[2]) + 1
         gz = (((group_linear - 1) ÷ (groups[1] * groups[2])) % groups[3]) + 1
         for tz in 1:threads[3], ty in 1:threads[2], tx in 1:threads[1]
-            _set_kernel_state!(KernelState(Int32(gx), Int32(gy), Int32(gz),
-                                           Int32(tx), Int32(ty), Int32(tz)))
-            abi_call(kernel.fptr, Nothing, full_tt, kernel.f, converted_args...)
+            ks = KernelState(Int32(gx), Int32(gy), Int32(gz),
+                             Int32(tx), Int32(ty), Int32(tz))
+            _set_kernel_state!(ks)  # also update buffer for non-compiled path
+            abi_call(kernel.fptr, Nothing, full_tt, ks, kernel.f, converted_args...)
         end
     end
     return nothing

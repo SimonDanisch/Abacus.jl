@@ -9,7 +9,6 @@ using StaticArrays
 using GPUArrays
 using GPUArraysCore
 using Libdl
-using LLD_jll
 
 import KernelAbstractions
 
@@ -41,5 +40,11 @@ include("AbacusKernels.jl")
 import .AbacusKernels: AbacusBackend
 
 export AbacusBackend, AbacusArray, AbacusVector, AbacusMatrix, AbacusDeviceArray, @abacus
+
+function __init__()
+    # Allocate a fresh per-thread kernel state buffer. This must run at module-load
+    # time (not precompile time) so the pointer is valid in the current process.
+    _init_kernel_states!()
+end
 
 end # module Abacus
