@@ -9,6 +9,7 @@ using StaticArrays
 using GPUArrays
 using GPUArraysCore
 using Libdl
+using LLD_jll
 
 import KernelAbstractions
 

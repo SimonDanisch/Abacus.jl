@@ -26,7 +26,13 @@ const _allowed_intrinsics = Set([
     "ijl_object_id__cold", "jl_object_id__cold",
     "ijl_string_to_string", "jl_string_to_string",
     "ijl_symbol_name", "jl_symbol_name",
+    # C runtime functions (struct copies, math lowered from LLVM intrinsics)
     "memcpy", "memset", "memmove",
+    "powf", "sqrtf", "sinf", "cosf", "tanf",
+    "expf", "exp2f", "logf", "log2f", "log10f",
+    "fabsf", "floorf", "ceilf", "roundf", "truncf",
+    "fmodf", "fmaf", "fminf", "fmaxf",
+    "atan2f", "asinf", "acosf", "atanf",
 ])
 GPUCompiler.isintrinsic(::AbacusCompilerJob, fn::String) = fn in _allowed_intrinsics
 
@@ -73,8 +79,8 @@ function GPUCompiler.validate_ir(job::AbacusCompilerJob, mod::LLVM.Module)
     # struct type that an LLVM scalarization pass incorrectly transforms into a
     # type-mismatched scalar `select` (the verifier diagnoses "Select values must have
     # same type as select instruction"). Without this, such broken IR silently passes
-    # Abacus's LLJIT (which is more permissive) but crashes Metal's `air` or SPIR-V's
-    # `llc` with an opaque "Broken function found, compilation aborted" message.
+    # validation but crashes Metal's `air` or SPIR-V's `llc` with an opaque
+    # "Broken function found, compilation aborted" message.
     try
         LLVM.verify(mod)
     catch e
@@ -113,55 +119,20 @@ end
     CompilerConfig(target, params; kernel, name, always_inline)
 end
 
-# Global LLJIT instance (session lifetime) for in-process kernel JIT execution.
-const _lljit = Ref{Any}(nothing)
-const _lljit_lock = ReentrantLock()
-
-function _get_or_create_lljit()
-    Base.@lock _lljit_lock begin
-        if _lljit[] === nothing
-            jit = LLVM.LLJIT(; tm=LLVM.JITTargetMachine())
-            jd = LLVM.JITDylib(jit)
-            # Resolve symbols from the host process (malloc, free, etc.)
-            prefix = Sys.isapple() ? '_' : '\0'
-            gen = LLVM.CreateDynamicLibrarySearchGeneratorForProcess(prefix)
-            LLVM.add!(jd, gen)
-
-            # On Windows/MinGW, GPUCompiler strips probe-stack="inline-asm" so LLJIT's
-            # codegen emits calls to ___chkstk_ms (from static libgcc.a) for large frames.
-            # That symbol isn't in any DLL, but ntdll __chkstk has identical semantics:
-            # both take the frame size in %rax, probe stack pages, and leave %rsp unchanged.
-            # Register ntdll's __chkstk under the name ___chkstk_ms so LLJIT can link it.
-            if Sys.iswindows()
-                ntdll = Libdl.dlopen("ntdll.dll"; throw_error=false)
-                if ntdll !== nothing
-                    ptr = Libdl.dlsym(ntdll, "__chkstk"; throw_error=false)
-                    if ptr !== nothing
-                        sym = LLVM.mangle(jit, "___chkstk_ms")
-                        pair = LLVM.API.LLVMOrcCSymbolMapPair(
-                            sym.ref,
-                            LLVM.API.LLVMJITEvaluatedSymbol(
-                                reinterpret(UInt64, ptr),
-                                LLVM.API.LLVMJITSymbolFlags(
-                                    UInt8(LLVM.API.LLVMJITSymbolGenericFlagsExported |
-                                          LLVM.API.LLVMJITSymbolGenericFlagsCallable),
-                                    UInt8(0)
-                                )
-                            )
-                        )
-                        mu = LLVM.absolute_symbols([pair])
-                        LLVM.define(jd, mu)
-                    end
-                end
-            end
-
-            _lljit[] = jit
-        end
-        return _lljit[]::LLVM.LLJIT
+# Persistent directory for compiled shared libraries.
+# Includes Julia version to auto-invalidate cache when Julia is upgraded.
+const _sodir = Ref{String}("")
+function sodir()
+    if isempty(_sodir[])
+        dir = joinpath(first(Base.DEPOT_PATH), "compiled", "abacus_kernels",
+                       "jl$(VERSION.major).$(VERSION.minor)")
+        mkpath(dir)
+        _sodir[] = dir
     end
+    return _sodir[]
 end
 
-# compile: LLVM IR → optimize → convert state arg to pointer → serialize to bitcode.
+# compile: LLVM IR → optimize → convert state arg to pointer → emit PIC object code.
 # kernel_state_to_reference! wraps the entry function so the KernelState is received
 # as a ptr (loaded on entry) instead of by value, matching ccall's Ptr{KernelState}.
 function compile(@nospecialize(job::CompilerJob))
@@ -182,7 +153,6 @@ function compile(@nospecialize(job::CompilerJob))
             if haskey(LLVM.functions(mod), entry_fn)
                 entry_f = LLVM.functions(mod)[entry_fn]
                 GPUCompiler.kernel_state_to_reference!(job, mod, entry_f)
-                # kernel_state_to_reference! preserves the function name
             end
         end
 
@@ -190,37 +160,145 @@ function compile(@nospecialize(job::CompilerJob))
         # transformations (prepare_execution! + kernel_state_to_reference!).
         LLVM.verify(mod)
 
-        bitcode = convert(Vector{UInt8}, mod)
-        (; bitcode, entry=entry_fn)
+        if Sys.iswindows()
+            # Julia's LLVM on MinGW produces ELF object files (the x86_64-w64-mingw32
+            # target has ELF mangling m:e). Switch to the MSVC triple so LLVM's codegen
+            # emits proper COFF, which lld-link can turn into a DLL.
+            msvc_triple = "x86_64-pc-windows-msvc"
+            t = LLVM.Target(triple=msvc_triple)
+            tm = LLVM.TargetMachine(t, msvc_triple; reloc=LLVM.API.LLVMRelocPIC)
+            LLVM.triple!(mod, msvc_triple)
+            LLVM.datalayout!(mod, LLVM.DataLayout(tm))
+
+            # Disable stack probing entirely. GPUCompiler strips probe-stack (GPU code
+            # doesn't need it), and on MSVC targets LLVM would otherwise insert calls to
+            # __chkstk which we'd need to import from ntdll.dll. Our kernels run on the
+            # host CPU with adequate stack, so probing is unnecessary.
+            for fn in LLVM.functions(mod)
+                if !LLVM.isdeclaration(fn)
+                    push!(LLVM.function_attributes(fn),
+                          LLVM.StringAttribute("no-stack-arg-probe", ""))
+                end
+            end
+
+            # MSVC CRT requires _fltused to be defined when floating-point code is present.
+            if !haskey(LLVM.globals(mod), "_fltused")
+                i32 = LLVM.Int32Type()
+                gv = LLVM.GlobalVariable(mod, i32, "_fltused")
+                LLVM.initializer!(gv, LLVM.ConstantInt(i32, 1))
+                LLVM.linkage!(gv, LLVM.API.LLVMExternalLinkage)
+            end
+        else
+            # Linux / macOS: emit with the native triple.
+            triple = LLVM.triple(mod)
+            t = LLVM.Target(triple=triple)
+            tm = LLVM.TargetMachine(t, triple; reloc=LLVM.API.LLVMRelocPIC)
+        end
+
+        obj = LLVM.emit(tm, mod, LLVM.API.LLVMObjectFile)
+        (; obj, entry=entry_fn)
     end
 end
 
-# link: parse bitcode → align triple/datalayout to LLJIT → add to LLJIT → return fptr
+# Windows CRT import library for lld-link.
+# lld-link /noentry creates DLLs without the C runtime. When kernels reference
+# C runtime functions (memmove from struct copies, powf from math), the linker
+# needs an import library that maps these symbols to ucrtbase.dll.
+const _ucrt_symbols = [
+    "malloc", "free",
+    "memmove", "memcpy", "memset",
+    "powf", "sqrtf", "sinf", "cosf", "tanf",
+    "expf", "exp2f", "logf", "log2f", "log10f",
+    "fabsf", "floorf", "ceilf", "roundf", "truncf",
+    "fmodf", "fmaf", "fminf", "fmaxf",
+    "atan2f", "asinf", "acosf", "atanf",
+    "sinhf", "coshf", "tanhf", "copysignf", "cbrtf",
+    "pow", "sqrt", "sin", "cos", "tan",
+    "exp", "exp2", "log", "log2", "log10",
+    "fabs", "floor", "ceil", "round", "trunc",
+    "fmod", "fma", "fmin", "fmax",
+    "atan2", "asin", "acos", "atan",
+]
+const _ucrt_importlib = Ref{String}("")
+function _ensure_ucrt_importlib()
+    lib = _ucrt_importlib[]
+    if !isempty(lib) && isfile(lib)
+        return lib
+    end
+    dir = sodir()
+    def_path = joinpath(dir, "ucrt.def")
+    lib_path = joinpath(dir, "ucrt.lib")
+    open(def_path, "w") do io
+        println(io, "LIBRARY ucrtbase.dll")
+        println(io, "EXPORTS")
+        for sym in _ucrt_symbols
+            println(io, "    ", sym)
+        end
+    end
+    LLD_jll.lld() do exe
+        run(`$exe -flavor link /lib /def:$def_path /machine:x64 /out:$lib_path`)
+    end
+    rm(def_path; force=true)
+    _ucrt_importlib[] = lib_path
+    return lib_path
+end
+
+# Link object code into a platform-specific shared library.
+function _link_shlib(obj_path, lib_path, entry_name)
+    if Sys.isapple()
+        # Apple's cc (clang) handles Mach-O shared libraries natively.
+        # -undefined dynamic_lookup allows unresolved symbols (resolved at dlopen time).
+        run(`cc -shared -undefined dynamic_lookup -o $lib_path $obj_path`)
+    elseif Sys.iswindows()
+        # lld-link creates a PE DLL from the COFF object file.
+        # /noentry: no DllMain needed. /export: makes the kernel symbol visible to dlsym.
+        # Must use the LLD_jll.lld() wrapper so lld.exe finds its LLVM shared libraries.
+        # Link against ucrtbase.dll import lib to resolve CRT symbols (memmove, powf, etc.).
+        ucrt_lib = _ensure_ucrt_importlib()
+        LLD_jll.lld() do exe
+            run(`$exe -flavor link /dll /noentry /export:$entry_name /out:$lib_path $obj_path $ucrt_lib`)
+        end
+    else
+        # Linux/other: standard ELF shared library via LLD's GNU-compatible driver.
+        LLD_jll.lld() do exe
+            run(`$exe -flavor gnu -shared -o $lib_path $obj_path`)
+        end
+    end
+end
+
+# Hash-based short filename to avoid Windows MAX_PATH (260 char) limit.
+# Long C++ mangled names like _Z30gpu_broadcast_kernel_cartesian16CompilerMetadata...
+# easily exceed this. The symbol name is still used for dlsym lookup.
+_lib_basename(entry::String) = string(hash(entry); base=16)
+
+# link: write .o → link shared library → dlopen → dlsym → Ptr{Cvoid}
 function link(@nospecialize(job::CompilerJob), compiled)
-    jit = _get_or_create_lljit()
-    jd = LLVM.JITDylib(jit)
+    dir = sodir()
+    base = _lib_basename(compiled.entry)
+    lib_path = joinpath(dir, "$(base).$(Libdl.dlext)")
 
-    # Check if the symbol is already loaded (e.g. same kernel compiled again after a
-    # REPL method redefinition creates a new MethodInstance cache miss). Compilation is
-    # deterministic for the same (specTypes, config), so reuse the existing definition.
-    try
-        addr = LLVM.lookup(jit, compiled.entry)
-        fptr = LLVM.pointer(addr)
-        fptr != C_NULL && return fptr
-    catch
+    # Fast path: reuse previously linked shared library from persistent cache.
+    if isfile(lib_path)
+        handle = Libdl.dlopen(lib_path; throw_error=false)
+        if handle !== nothing
+            fptr = Libdl.dlsym(handle, compiled.entry; throw_error=false)
+            if fptr !== C_NULL && fptr !== nothing
+                return fptr
+            end
+        end
     end
 
-    JuliaContext() do ctx
-        mod = parse(LLVM.Module, compiled.bitcode)
-        # Align module triple and data layout with the LLJIT target.
-        LLVM.triple!(mod, LLVM.triple(jit))
-        LLVM.datalayout!(mod, LLVM.datalayout(jit))
-        LLVM.add!(jit, jd, LLVM.ThreadSafeModule(mod))
+    # Write object code and link to shared library.
+    obj_path = joinpath(dir, "$(base).o")
+    open(obj_path, "w") do io
+        write(io, compiled.obj)
     end
+    _link_shlib(obj_path, lib_path, compiled.entry)
+    rm(obj_path; force=true)  # cleanup intermediate object file
 
-    addr = LLVM.lookup(jit, compiled.entry)
-    fptr = LLVM.pointer(addr)
-    @assert fptr != C_NULL "Failed to find symbol $(compiled.entry)"
+    handle = Libdl.dlopen(lib_path)
+    fptr = Libdl.dlsym(handle, compiled.entry)
+    @assert fptr != C_NULL "Failed to find symbol $(compiled.entry) in $lib_path"
     return fptr
 end
 
