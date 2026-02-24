@@ -22,7 +22,7 @@ GPUCompiler.kernel_state_type(::VkCompilerJob) = Nothing
 # NOTE: __spirv_* (SPIR-V friendly IR) naming convention does NOT work with
 # the Vulkan target — only with OpenCL SPIR-V (spirv64-unknown-unknown).
 GPUCompiler.isintrinsic(::VkCompilerJob, fn::String) =
-    startswith(fn, "llvm.spv.")
+    startswith(fn, "llvm.spv.") || fn in known_intrinsics
 
 # Compiler cache: keyed by (MethodInstance objectid, world, config) via GPUCompiler.cached_compilation
 const _vk_compiler_cache = Dict{Any, Any}()
@@ -55,7 +55,7 @@ end
     target = GPUCompiler.SPIRVCompilerTarget(;
         backend = :vulkan,
         validate = false,   # we validate after fixup
-        supports_fp64 = false,
+        supports_fp64 = true,
     )
     params = VkCompilerParams(workgroup_size)
     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
@@ -174,8 +174,16 @@ function vkcompile(@nospecialize(job::GPUCompiler.CompilerJob))
         LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod)
         LLVM.run!(LLVM.FixIrreduciblePass(), mod)
         LLVM.run!(LLVM.StructurizeCFGPass(), mod)
+
+        # Fix structured CFG: ensure no basic block is the merge target of
+        # multiple SPIR-V constructs. Like clspv's FixupStructuredCFGPass.
+        _fixup_structured_cfg!(mod)
+
+        # StructurizeCFG introduces reg2mem (alloca+load+store) patterns.
+        # InstCombine cleans up bitcasts that crash llc's "SPIRV legalize bitcast pass".
+        # Do NOT run SimplifyCFG here — it merges blocks and destroys the
+        # structured control flow, causing "Block is already a merge block" errors.
         LLVM.run!(LLVM.InstCombinePass(), mod)
-        LLVM.run!(LLVM.SimplifyCFGPass(), mod)
 
         # Strip debug info (SPIR-V tools don't handle Julia's debug info)
         LLVM.strip_debuginfo!(mod)
@@ -455,15 +463,31 @@ function _llvm_type_size(t::LLVM.LLVMType)
     end
 end
 
-"""Prepare the LLVM module for Vulkan SPIR-V emission.
+# Return the size in bytes of the largest scalar component in `ty`.
+function _scalar_size(t::LLVM.LLVMType)
+    if t isa LLVM.IntegerType
+        return div(LLVM.width(t) + 7, 8)
+    elseif t == LLVM.FloatType()
+        return 4
+    elseif t == LLVM.DoubleType()
+        return 8
+    elseif t == LLVM.HalfType()
+        return 2
+    elseif t isa LLVM.StructType
+        sz = 0
+        for m in LLVM.elements(t)
+            sz = max(sz, _scalar_size(m))
+        end
+        return sz
+    elseif t isa LLVM.ArrayType || t isa LLVM.VectorType
+        return _scalar_size(LLVM.eltype(t))
+    elseif t isa LLVM.PointerType
+        return 8
+    else
+        return 4
+    end
+end
 
-Performs fixups at the LLVM IR level that would otherwise require fragile
-text-based SPIR-V post-processing:
-- Strip `llvm.lifetime.*` intrinsics (require Kernel capability, Vulkan-illegal)
-- Set all non-entry functions to internal linkage (prevents LinkageAttributes
-  decorations and OpCapability Linkage in the output)
-- Fix alignment on loads/stores (Vulkan requires alignment >= type size)
-"""
 function _prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String)
     # 1. Strip llvm.lifetime.start/end intrinsics and set internal linkage
     for f in LLVM.functions(mod)
@@ -492,10 +516,19 @@ function _prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String)
                     end
                 elseif inst isa LLVM.LoadInst || inst isa LLVM.StoreInst
                     # Fix alignment: Vulkan PhysicalStorageBuffer requires
-                    # alignment >= natural type size. LLVM defaults to 1.
+                    # alignment >= natural size of the largest scalar in the type
+                    # (VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314).
                     align = LLVM.alignment(inst)
-                    if align > 0 && align < 4
-                        LLVM.alignment!(inst, 4)
+                    if align > 0
+                        ty = if inst isa LLVM.LoadInst
+                            LLVM.value_type(inst)
+                        else
+                            LLVM.value_type(LLVM.operands(inst)[1])
+                        end
+                        min_align = max(4, _scalar_size(ty))
+                        if align < min_align
+                            LLVM.alignment!(inst, min_align)
+                        end
                     end
                 end
             end
@@ -522,7 +555,14 @@ function _prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String)
     # producing OpAccessChain without indices.  Rewrite back to structured form.
     _fix_shared_geps!(mod)
 
-    # 4. Hoist push constant loads into the entry block.
+    # 4. Flatten array-typed GEPs in addrspace(1) (BDA / PhysicalStorageBuffer).
+    #    Julia compiles tuple stores as `getelementptr [3 x float], ptr addrspace(1), 0, idx`.
+    #    The SPIR-V backend emits OpTypeArray without ArrayStride, which Vulkan requires
+    #    for PhysicalStorageBuffer. Flatten to `getelementptr float, ptr, idx` so the
+    #    array type never appears in SPIR-V.
+    _flatten_bda_array_geps!(mod)
+
+    # 5. Hoist push constant loads into the entry block.
     # The LLVM SPIR-V backend correctly translates ConstantExpr GEPs on push
     # constants in the entry block but mishandles them in non-entry blocks
     # (producing byte-offset arithmetic instead of struct member access chains).
@@ -678,14 +718,174 @@ function _strip_assume!(mod::LLVM.Module)
 end
 
 """
+    _fixup_structured_cfg!(mod::LLVM.Module)
+
+Post-StructurizeCFG fixup pass, analogous to clspv's `FixupStructuredCFGPass`.
+
+The LLVM SPIR-V backend assigns merge targets to structured constructs:
+- Loop headers get `OpLoopMerge` targeting the loop exit block
+- Conditional branches (non-latch) get `OpSelectionMerge` targeting the post-dominator
+
+If a block is targeted by multiple conditional branches from different nesting
+levels (e.g., both an outer selection and an inner loop target the same exit),
+the SPIR-V backend produces duplicate merge targets, which is illegal in Vulkan.
+
+Fix: detect blocks that are the successor of multiple conditional branches and
+insert trampoline blocks so each construct gets its own unique merge target.
+"""
+function _fixup_structured_cfg!(mod::LLVM.Module)
+    for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+        _isolate_shared_merge_targets!(f)
+    end
+end
+
+function _isolate_shared_merge_targets!(f::LLVM.Function)
+    # Find blocks that are successors of multiple conditional branches.
+    # Each such block would become a merge target of multiple SPIR-V constructs.
+    # Map: target_block → [source_blocks that conditionally branch to it]
+    cond_sources = Dict{LLVM.BasicBlock, Vector{LLVM.BasicBlock}}()
+    for bb in LLVM.blocks(f)
+        term = LLVM.terminator(bb)
+        term isa LLVM.BrInst || continue
+        LLVM.isconditional(term) || continue
+        for succ in LLVM.successors(term)
+            sources = get!(cond_sources, succ, LLVM.BasicBlock[])
+            # Avoid counting the same source twice (both branches to same target)
+            bb in sources || push!(sources, bb)
+        end
+    end
+
+    for (target, sources) in cond_sources
+        length(sources) <= 1 && continue
+
+        # Keep the first source unchanged, redirect all others through trampolines.
+        # The first source (in block order) keeps the direct edge; later ones get
+        # trampolines. This matches clspv's isolateContinue() strategy.
+        for src in sources[2:end]
+            _insert_cfg_trampoline!(f, src, target)
+        end
+    end
+end
+
+"""Insert a trampoline block isolating `src`'s construct from `target`.
+
+When `src` is a conditional branch header whose construct (all blocks reachable
+from `src` without passing through `target`) also has blocks that branch to
+`target`, ALL those branches must be redirected through the trampoline. Otherwise
+the SPIR-V backend creates a construct where inner blocks exit "not via structured
+exit". This mirrors clspv's `isolateContinue()`.
+"""
+function _insert_cfg_trampoline!(f::LLVM.Function, src::LLVM.BasicBlock,
+                                  target::LLVM.BasicBlock)
+    # Step 1: find all blocks "inside" src's construct.
+    # = blocks reachable from src without passing through target.
+    # In structured CFG, the only exit from a construct is through its merge block.
+    inside = Set{LLVM.BasicBlock}()
+    worklist = LLVM.BasicBlock[src]
+    while !isempty(worklist)
+        bb = pop!(worklist)
+        bb in inside && continue    # already visited
+        bb == target && continue     # don't enter target
+        push!(inside, bb)
+        term = LLVM.terminator(bb)
+        for succ in LLVM.successors(term)
+            push!(worklist, succ)
+        end
+    end
+
+    # Step 2: create trampoline block (just branches to target)
+    tramp = LLVM.BasicBlock(f, "cfg_fixup")
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, tramp)
+        LLVM.br!(builder, target)
+    end
+
+    # Step 3: redirect ALL branches from inside blocks to target → trampoline
+    for bb in inside
+        term = LLVM.terminator(bb)
+        succs = LLVM.successors(term)
+        for i in 1:length(succs)
+            if succs[i] == target
+                succs[i] = tramp
+            end
+        end
+    end
+
+    # Step 4: update PHI nodes in target.
+    # Multiple inside blocks may have been predecessors of target with different
+    # values. They all now arrive via trampoline, so we need a PHI in trampoline
+    # to merge their values, and a single entry in target's PHI from trampoline.
+    for inst in collect(LLVM.instructions(target))
+        inst isa LLVM.PHIInst || break  # PHIs are always at block start
+
+        inc = LLVM.incoming(inst)
+        # Partition incoming into inside vs outside
+        inside_pairs = Tuple{LLVM.Value, LLVM.BasicBlock}[]
+        outside_pairs = Tuple{LLVM.Value, LLVM.BasicBlock}[]
+        for k in 1:length(inc)
+            val, blk = inc[k]
+            if blk in inside
+                push!(inside_pairs, (val, blk))
+            else
+                push!(outside_pairs, (val, blk))
+            end
+        end
+
+        isempty(inside_pairs) && continue
+
+        # Determine the value arriving from the trampoline
+        tramp_val = if length(inside_pairs) == 1
+            # Single inside predecessor: use its value directly
+            inside_pairs[1][1]
+        elseif all(p -> p[1] == inside_pairs[1][1], inside_pairs)
+            # All inside predecessors contribute the same value
+            inside_pairs[1][1]
+        else
+            # Multiple different values: create a PHI in the trampoline
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                # Position before the terminator (branch) in trampoline
+                LLVM.position!(builder, LLVM.terminator(tramp))
+                phi = LLVM.phi!(builder, LLVM.value_type(inst), "tramp.phi")
+                append!(LLVM.incoming(phi), inside_pairs)
+                phi
+            end
+        end
+
+        # Rebuild target's PHI with trampoline as single predecessor for inside blocks
+        new_pairs = copy(outside_pairs)
+        push!(new_pairs, (tramp_val, tramp))
+
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, inst)
+            new_phi = LLVM.phi!(builder, LLVM.value_type(inst), LLVM.name(inst) * ".fix")
+            append!(LLVM.incoming(new_phi), new_pairs)
+            LLVM.replace_uses!(inst, new_phi)
+            LLVM.erase!(inst)
+        end
+    end
+end
+
+"""
 Fix GEPs on addrspace(3) array globals for SPIR-V backend compatibility.
 
-Two fixups:
+Three fixups:
 1. Rewrite flat instruction GEPs (`getelementptr T, ptr @arr, idx`) to structured
    two-index form (`getelementptr [N x T], ptr @arr, 0, idx`). The LLVM SPIR-V backend
    silently drops the index in flat form.
-2. Lower ConstantExpr GEPs on shared globals to instruction GEPs. The SPIR-V backend
-   converts ConstantExpr GEPs to byte-offset bitcast+AccessChain, which is invalid.
+2. Fix ConstantExpr GEP loads/stores on shared globals. The SPIR-V backend converts
+   ConstantExpr GEPs to byte-offset bitcast+AccessChain, which is invalid.
+3. Fix bare global loads/stores (`load float, ptr addrspace(3) @arr`) where InstCombine
+   has constant-folded `GEP @arr, 0, 0` away. The SPIR-V backend crashes in its
+   "legalize bitcast" pass because it needs an OpAccessChain to go from the array
+   variable to element 0, but without a GEP there's no access chain to emit.
+
+For fixups 2+3, we need non-constant element indices to prevent the IRBuilder's
+constant folder from collapsing the GEP back to a ConstantExpr or bare global.
+We find an existing i32 SSA value in the function (e.g. the thread ID from
+extractelement) and use `sub %val, %val` / `sext` to create a non-constant i64
+zero. The first GEP index (array-of-arrays offset) MUST remain constant `i64 0`
+— the SPIR-V backend crashes if it's non-constant.
 """
 function _fix_shared_geps!(mod::LLVM.Module)
     # Collect addrspace(3) globals with array type
@@ -701,7 +901,56 @@ function _fix_shared_geps!(mod::LLVM.Module)
 
     isempty(shared_globals) && return
 
+    T_i32 = LLVM.Int32Type()
+    T_i64 = LLVM.Int64Type()
+
     for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+
+        # Lazily created non-constant i64 zero (one per function).
+        # Uses `sub %val, %val` on an existing i32 instruction to produce 0
+        # without being recognized as a constant by the IRBuilder's folder.
+        nonconst_zero = Ref{Union{Nothing, LLVM.Value}}(nothing)
+
+        function _get_nonconst_zero!()
+            nonconst_zero[] !== nothing && return nonconst_zero[]::LLVM.Value
+            entry_bb = first(LLVM.blocks(f))
+            # Find an existing i32 instruction in the entry block to derive zero from
+            donor = nothing
+            for inst in LLVM.instructions(entry_bb)
+                if LLVM.value_type(inst) == T_i32 && inst != LLVM.terminator(entry_bb)
+                    donor = inst
+                    break
+                end
+            end
+            if donor === nothing
+                # Fallback: no i32 instruction found, create sub from first i32 param
+                for p in LLVM.parameters(f)
+                    if LLVM.value_type(p) == T_i32
+                        donor = p
+                        break
+                    end
+                end
+            end
+            @assert donor !== nothing "No i32 value found for non-constant zero"
+
+            # Insert sub+sext right after the donor (or at entry start for params)
+            ncz = LLVM.IRBuilder() do b
+                insert_pt = if donor isa LLVM.Instruction
+                    # Insert after the donor instruction
+                    next = LLVM.API.LLVMGetNextInstruction(donor)
+                    next == C_NULL ? LLVM.terminator(entry_bb) : LLVM.Instruction(next)
+                else
+                    first(LLVM.instructions(entry_bb))
+                end
+                LLVM.position!(b, insert_pt)
+                z32 = LLVM.sub!(b, donor, donor, "shared_zero32")
+                return LLVM.sext!(b, z32, T_i64, "shared_idx_zero")
+            end
+            nonconst_zero[] = ncz
+            return ncz
+        end
+
         for bb in LLVM.blocks(f)
             # Part 1: Fix flat instruction GEPs
             to_fix = Tuple{LLVM.GetElementPtrInst, LLVM.LLVMType}[]
@@ -733,51 +982,64 @@ function _fix_shared_geps!(mod::LLVM.Module)
                 end
             end
 
-            # Part 2: Lower ConstantExpr GEPs on shared globals to instruction GEPs.
-            # The SPIR-V backend converts ConstantExpr GEPs to byte-offset
-            # bitcast+AccessChain, producing invalid OpInBoundsAccessChain on
-            # non-composite types.
-            constexpr_fixes = Tuple{LLVM.Instruction, Int, LLVM.ConstantExpr,
-                                    LLVM.GlobalVariable, LLVM.LLVMType}[]
+            # Parts 2+3: Fix constant-index shared memory accesses.
+            # Collect loads/stores that use either:
+            #   (A) bare shared array global as pointer (element index 0)
+            #   (B) ConstantExpr GEP on shared array global (constant element index)
+            # Both crash llc. We replace with instruction GEPs using non-constant indices.
+            # Tuple: (instruction, operand_index, global, array_type, element_index)
+            const_fixes = Tuple{LLVM.Instruction, Int, LLVM.Value, LLVM.LLVMType, Int}[]
             for inst in LLVM.instructions(bb)
-                # Check pointer operands of loads (op 1) and stores (op 2)
                 if inst isa LLVM.LoadInst
                     ptr_op = LLVM.operands(inst)[1]
-                    op_idx = 0  # operand index for replacement
+                    op_idx = 0
                 elseif inst isa LLVM.StoreInst
                     ptr_op = LLVM.operands(inst)[2]
                     op_idx = 1
                 else
                     continue
                 end
-                ptr_op isa LLVM.ConstantExpr || continue
-                LLVM.API.LLVMGetConstOpcode(ptr_op) == LLVM.API.LLVMGetElementPtr || continue
 
-                # Check if base is a shared global
-                ce_ops = LLVM.operands(ptr_op)
-                gv = ce_ops[1]
-                haskey(shared_globals, gv) || continue
-                push!(constexpr_fixes, (inst, op_idx, ptr_op, gv, shared_globals[gv]))
+                # Case A: Bare global (constant-folded GEP @arr, 0, 0 → @arr)
+                if haskey(shared_globals, ptr_op)
+                    push!(const_fixes, (inst, op_idx, ptr_op, shared_globals[ptr_op], 0))
+                    continue
+                end
+
+                # Case B: ConstantExpr GEP (e.g. GEP @arr, 0, 1)
+                if ptr_op isa LLVM.ConstantExpr
+                    LLVM.API.LLVMGetConstOpcode(ptr_op) == LLVM.API.LLVMGetElementPtr || continue
+                    ce_ops = LLVM.operands(ptr_op)
+                    gv = ce_ops[1]
+                    haskey(shared_globals, gv) || continue
+                    # Extract element index: GEP @arr, 0, idx → idx is ce_ops[3]
+                    length(ce_ops) >= 3 || continue
+                    idx_val = ce_ops[3]
+                    idx_val isa LLVM.ConstantInt || continue
+                    elem_idx = convert(Int, idx_val)
+                    push!(const_fixes, (inst, op_idx, gv, shared_globals[gv], elem_idx))
+                end
             end
 
+            isempty(const_fixes) && continue
+
+            ncz = _get_nonconst_zero!()
+
+            zero_const = LLVM.ConstantInt(T_i64, 0)
+
             LLVM.IRBuilder() do builder
-                for (inst, op_idx, ce, gv, arr_ty) in constexpr_fixes
+                for (inst, op_idx, gv, arr_ty, elem_idx) in const_fixes
                     LLVM.position!(builder, inst)
-                    ce_ops = LLVM.operands(ce)
-                    # Use `freeze` on non-zero constant indices to prevent
-                    # the IRBuilder from constant-folding the GEP back into
-                    # a ConstantExpr (which the SPIR-V backend mishandles).
-                    indices = LLVM.Value[]
-                    for i in 2:length(ce_ops)
-                        idx = ce_ops[i]
-                        if idx isa LLVM.ConstantInt && convert(Int, idx) != 0
-                            push!(indices, LLVM.Value(
-                                LLVM.API.LLVMBuildFreeze(builder, idx, "idx.freeze")))
-                        else
-                            push!(indices, idx)
-                        end
+                    idx = if elem_idx == 0
+                        ncz
+                    else
+                        LLVM.add!(builder, ncz, LLVM.ConstantInt(T_i64, elem_idx),
+                                  "shared_idx.fix")
                     end
-                    new_gep = LLVM.gep!(builder, arr_ty, gv, indices, "constexpr_gep.fix")
+                    # First index MUST be constant 0 (array-of-arrays offset).
+                    # The SPIR-V backend crashes if the first index is non-constant.
+                    new_gep = LLVM.gep!(builder, arr_ty, gv,
+                                       LLVM.Value[zero_const, idx], "shared_gep.fix")
                     LLVM.API.LLVMSetOperand(inst, op_idx, new_gep)
                 end
             end
@@ -849,7 +1111,77 @@ function _hoist_push_constant_loads!(mod::LLVM.Module)
     end
 end
 
-"""Emit SPIR-V binary from an LLVM module using the LLVM SPIR-V backend."""
+"""
+Replace array-typed GEPs in addrspace(1) with explicit pointer arithmetic.
+
+Julia represents tuples as LLVM array types (e.g. [3 x float] for NTuple{3,Float32}).
+The SPIR-V backend emits OpTypeArray without ArrayStride decoration, which Vulkan requires
+for PhysicalStorageBuffer. The backend also drops indices from flat GEPs on raw pointers.
+
+Solution: replace `getelementptr [N x T], ptr, 0, idx` with ptrtoint→add→inttoptr,
+which produces OpConvertUToPtr in SPIR-V and avoids both array types and dropped indices.
+"""
+function _flatten_bda_array_geps!(mod::LLVM.Module)
+    i64 = LLVM.Int64Type()
+    dl = LLVM.datalayout(mod)
+    for f in LLVM.functions(mod)
+        for bb in LLVM.blocks(f)
+            to_fix = LLVM.GetElementPtrInst[]
+            for inst in LLVM.instructions(bb)
+                inst isa LLVM.GetElementPtrInst || continue
+
+                # Check pointer operand is addrspace(1) (BDA / CrossWorkgroup → PhysicalStorageBuffer)
+                ptr_op = LLVM.operands(inst)[1]
+                ptr_ty = LLVM.value_type(ptr_op)
+                ptr_ty isa LLVM.PointerType || continue
+                LLVM.addrspace(ptr_ty) == 1 || continue
+
+                # Check it's a structured GEP on an array type: [N x T], 0, idx
+                src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+                src_ty isa LLVM.ArrayType || continue
+
+                ops = LLVM.operands(inst)
+                length(ops) == 3 || continue  # ptr, 0, idx
+
+                # First index must be constant 0
+                idx0 = ops[2]
+                idx0 isa LLVM.ConstantInt || continue
+                convert(Int, idx0) == 0 || continue
+
+                push!(to_fix, inst)
+            end
+
+            isempty(to_fix) && continue
+
+            LLVM.IRBuilder() do builder
+                for gep in to_fix
+                    ops = LLVM.operands(gep)
+                    ptr_op = ops[1]
+                    idx = ops[3]  # the element index
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+                    elem_size = LLVM.storage_size(dl, eltype(src_ty))
+
+                    LLVM.position!(builder, gep)
+                    # ptrtoint → compute byte offset → add → inttoptr
+                    base_int = LLVM.ptrtoint!(builder, ptr_op, i64, "bda.base")
+                    idx64 = if LLVM.value_type(idx) == i64
+                        idx
+                    else
+                        LLVM.zext!(builder, idx, i64, "bda.idx")
+                    end
+                    stride = LLVM.ConstantInt(i64, elem_size)
+                    byte_off = LLVM.mul!(builder, idx64, stride, "bda.off")
+                    new_addr = LLVM.add!(builder, base_int, byte_off, "bda.addr")
+                    new_ptr = LLVM.inttoptr!(builder, new_addr, LLVM.value_type(ptr_op), LLVM.name(gep))
+
+                    LLVM.replace_uses!(gep, new_ptr)
+                    LLVM.erase!(gep)
+                end
+            end
+        end
+    end
+end
+
 function _emit_spirv(mod::LLVM.Module, target::GPUCompiler.SPIRVCompilerTarget)
     mktempdir() do dir
         bc_path = joinpath(dir, "kernel.bc")
@@ -859,7 +1191,11 @@ function _emit_spirv(mod::LLVM.Module, target::GPUCompiler.SPIRVCompilerTarget)
             write(io, mod)
         end
 
-        cmd = `$(SPIRV_LLVM_Backend_jll.llc()) $bc_path -filetype=obj -o $spv_path`
+        # -O0: prevent llc from collapsing StructurizeCFG's Flow blocks.
+        # At -O2 (default), the SPIR-V backend simplifies empty blocks, merging
+        # multiple OpSelectionMerge targets into one block (illegal in Vulkan).
+        # We already run our own LLVM optimization passes, so -O0 is safe here.
+        cmd = `$(SPIRV_LLVM_Backend_jll.llc()) $bc_path -filetype=obj -O0 -o $spv_path`
         if !isempty(target.extensions)
             str = join(map(ext -> "+$ext", target.extensions), ",")
             cmd = `$cmd -spirv-ext=$str`

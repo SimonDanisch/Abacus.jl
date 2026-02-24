@@ -20,7 +20,7 @@ struct VulkanBackend <: KA.GPU end
 KA.get_backend(::VkArray) = VulkanBackend()
 KA.synchronize(::VulkanBackend) = nothing   # dispatch is blocking
 
-KA.supports_float64(::VulkanBackend) = false
+KA.supports_float64(::VulkanBackend) = true
 KA.supports_atomics(::VulkanBackend) = false
 
 Adapt.adapt_storage(::VulkanBackend, a::Array) = Adapt.adapt(VkArray, a)
@@ -114,6 +114,18 @@ end
 
 @vk_device_override @inline function KA.__synchronize()
     Abacus.vk_workgroup_barrier()
+end
+
+# Vulkan SPIR-V (Shader capability) does not support OpOrdered/OpUnordered,
+# which Julia's isless generates via `fcmp ord` for NaN checks.
+# Override with simple < comparison (NaN handling dropped, matching GPU convention).
+@vk_device_override @inline function Base.isless(x::Float32, y::Float32)
+    x < y
+end
+
+@vk_device_override @inline function KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
+    len = prod(Dims)
+    Abacus.vk_localmemory(Val(Id), T, Val(len))
 end
 ## COV_EXCL_STOP
 

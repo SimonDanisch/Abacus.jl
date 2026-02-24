@@ -58,8 +58,9 @@ end
 
 GPUArrays.storage(a::VkArray) = a.data
 
-function GPUArrays.derive(::Type{T}, a::VkArray, dims::Dims{N}, offset::Int) where {T, N}
+function GPUArrays.derive(::Type{T}, a::VkArray{S}, dims::Dims{N}, offset::Int) where {T, S, N}
     ref = copy(a.data)
+    offset += (a.offset * sizeof(S)) ÷ sizeof(T)
     return VkArray{T, N}(ref, dims; offset)
 end
 

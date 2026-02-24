@@ -95,16 +95,18 @@ function _init_vulkan!()
     end
     compute_qf === nothing && error("No compute queue family found on $device_name")
 
-    # Enable buffer device address
+    # Enable buffer device address + shaderFloat64 + shaderInt64
     bda_features = Vulkan.PhysicalDeviceBufferDeviceAddressFeatures(
         true,   # bufferDeviceAddress
         false,  # bufferDeviceAddressCaptureReplay
         false   # bufferDeviceAddressMultiDevice
     )
+    core_features = Vulkan.PhysicalDeviceFeatures(
+        :shader_float_64, :shader_int_64)
 
     device_queue_ci = Vulkan.DeviceQueueCreateInfo(compute_qf, [1.0f0])
     device = unwrap(Vulkan.create_device(pd, [device_queue_ci], [], String[];
-        next = bda_features))
+        next = bda_features, enabled_features = core_features))
 
     queue = Vulkan.get_device_queue(device, compute_qf, 0)
 

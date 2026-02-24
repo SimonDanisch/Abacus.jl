@@ -12,30 +12,76 @@ const REDUCE_WGS = 256
 """
 Reduce a value across a workgroup using shared memory tree reduction.
 
-Arguments:
-- `op`:  reduction operator
-- `val`: this invocation's accumulated value
-- `neutral`: neutral element for `op`
-- `shared`: VkLocalArray with at least `wgs` elements (1-based indexing)
-- `lid`:  local invocation ID (0-based UInt32)
-- `wgs`:  workgroup size
+Uses compile-time unrolled barriers (no while loop) to avoid structured
+control flow issues in Vulkan SPIR-V. Mirrors AcceleratedKernels' reduce_group!.
 """
-@inline function _reduce_workgroup(op::OP, val::T, neutral::T,
+@inline function _reduce_workgroup(op::OP, val::T, ::T,
                                    shared::VkLocalArray{T},
-                                   lid::UInt32, wgs::UInt32) where {OP, T}
+                                   lid::UInt32, ::Val{WGS}) where {OP, T, WGS}
     @inbounds shared[lid + UInt32(1)] = val
     vk_workgroup_barrier()
 
-    stride = wgs >> UInt32(1)
-    while stride > UInt32(0)
-        if lid < stride
-            @inbounds left = shared[lid + UInt32(1)]
-            other_idx = lid + stride
-            @inbounds right = other_idx < wgs ? shared[other_idx + UInt32(1)] : neutral
-            @inbounds shared[lid + UInt32(1)] = op(left, right)
+    # Compile-time unrolled tree reduction — each `if` is statically eliminated
+    # when WGS is smaller than the threshold, so no runtime loop needed.
+    if WGS >= 1024
+        if lid < UInt32(512)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(512) + UInt32(1)])
         end
         vk_workgroup_barrier()
-        stride >>= UInt32(1)
+    end
+    if WGS >= 512
+        if lid < UInt32(256)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(256) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 256
+        if lid < UInt32(128)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(128) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 128
+        if lid < UInt32(64)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(64) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 64
+        if lid < UInt32(32)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(32) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 32
+        if lid < UInt32(16)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(16) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 16
+        if lid < UInt32(8)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(8) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 8
+        if lid < UInt32(4)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(4) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 4
+        if lid < UInt32(2)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(2) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
+    end
+    if WGS >= 2
+        if lid < UInt32(1)
+            @inbounds shared[lid + UInt32(1)] = op(shared[lid + UInt32(1)], shared[lid + UInt32(1) + UInt32(1)])
+        end
+        vk_workgroup_barrier()
     end
 
     return @inbounds shared[UInt32(1)]
@@ -50,7 +96,7 @@ workgroup using shared memory, and writes one result per workgroup to `R`.
 function _vk_reduce_kernel(f::F, op::OP,
                            A_addr::UInt64, R_addr::UInt64,
                            n::UInt32, neutral::T,
-                           ::Val{WGS}) where {F, OP, T, WGS}
+                           ::Val{WGS}, ::Val{MAX_ITERS}) where {F, OP, T, WGS, MAX_ITERS}
     A = VkPtr{T}(A_addr)
     R = VkPtr{T}(R_addr)
 
@@ -62,16 +108,22 @@ function _vk_reduce_kernel(f::F, op::OP,
     # Allocate workgroup shared memory
     shared = vk_localmemory(T, Val(WGS))
 
-    # Grid-stride accumulation: each thread reduces multiple input elements
+    # Grid-stride accumulation with bounded iteration count.
+    # MAX_ITERS is computed host-side as ceil(n / (wgs * ngroups)).
+    # Using a bounded for loop avoids data-dependent while loops that
+    # cause structured control flow issues in Vulkan SPIR-V.
     val = neutral
     idx = lid + gid * wgs
-    while idx < n
-        val = op(val, f(A[(idx % UInt64) + UInt64(1)]))
-        idx += wgs * ngroups
+    stride = wgs * ngroups
+    for _ in UInt32(1):UInt32(MAX_ITERS)
+        if idx < n
+            val = op(val, f(A[(idx % UInt64) + UInt64(1)]))
+        end
+        idx += stride
     end
 
-    # Workgroup tree reduction
-    result = _reduce_workgroup(op, val, neutral, shared, lid, wgs)
+    # Workgroup tree reduction (compile-time unrolled, no while loop)
+    result = _reduce_workgroup(op, val, neutral, shared, lid, Val(WGS))
 
     # First thread writes workgroup result
     if lid == UInt32(0)
@@ -120,10 +172,14 @@ end
 function _dispatch_reduce!(f, op, A::VkArray{T}, R::VkArray{T},
                            n::UInt32, neutral::T,
                            wgs::Int, ngroups::Int) where T
+    # Compute max iterations for grid-stride loop (compile-time constant)
+    total_threads = wgs * ngroups
+    max_iters = cld(Int(n), total_threads)
+
     # Build argument tuple matching _vk_reduce_kernel signature
     kernel_args = (f, op,
                    device_address(A), device_address(R),
-                   n, neutral, Val(wgs))
+                   n, neutral, Val(wgs), Val(max_iters))
     adapted_args = map(kernel_convert, kernel_args)
     adapted_tt = Tuple{map(Core.Typeof, adapted_args)...}
 

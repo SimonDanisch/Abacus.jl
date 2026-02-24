@@ -1,5 +1,7 @@
 # Vulkan compute pipeline creation and caching
 
+using SPIRV_Tools_jll
+
 struct VkComputePipeline
     shader_module::Vulkan.ShaderModule
     pipeline_layout::Vulkan.PipelineLayout
@@ -9,6 +11,52 @@ end
 
 # Cache: (spirv_bytes_hash, push_constant_size) → VkComputePipeline
 const _pipeline_cache = Dict{UInt, VkComputePipeline}()
+
+"""
+    _validate_spirv(spirv_bytes) -> nothing
+
+Validate SPIR-V binary with spirv-val for Vulkan 1.3.
+Throws an error if validation fails, preventing driver segfaults from invalid SPIR-V.
+"""
+# Known spirv-val errors that are acceptable (drivers handle them correctly).
+# See VULKAN_FINDINGS.md for rationale on each.
+const _SPIRV_VAL_IGNORED_VUIDS = [
+    # Barrier SequentiallyConsistent semantics: strictly stronger than required
+    # AcquireRelease. RADV/ANV accept it. No LLVM-level fix exists (verified via MWE).
+    "VUID-StandaloneSpirv-MemorySemantics-10866",
+]
+
+function _validate_spirv(spirv_bytes::Vector{UInt8})
+    mktempdir() do dir
+        spv_path = joinpath(dir, "kernel.spv")
+        write(spv_path, spirv_bytes)
+
+        # Run spirv-val via JLL do-block, capturing stderr
+        SPIRV_Tools_jll.spirv_val() do val_exe
+            err_buf = IOBuffer()
+            proc = run(pipeline(ignorestatus(`$val_exe --target-env vulkan1.3 $spv_path`);
+                                stderr=err_buf))
+            if proc.exitcode != 0
+                err_text = String(take!(err_buf))
+                # Filter out known-acceptable errors
+                real_errors = filter(split(err_text, '\n')) do line
+                    startswith(line, "error:") &&
+                        !any(vuid -> contains(line, vuid), _SPIRV_VAL_IGNORED_VUIDS)
+                end
+                isempty(real_errors) && return  # all errors are known-acceptable
+                # Get disassembly for debugging
+                dis = SPIRV_Tools_jll.spirv_dis() do dis_exe
+                    try read(`$dis_exe --raw-id $spv_path`, String) catch; "" end
+                end
+                dis_lines = split(dis, '\n')
+                dis_tail = join(last(dis_lines, 40), '\n')
+                error("SPIR-V validation failed — refusing to create pipeline (would segfault driver).\n",
+                      "spirv-val errors:\n", join(real_errors, '\n'), "\n\n",
+                      "Disassembly (last 40 lines):\n$dis_tail")
+            end
+        end
+    end
+end
 
 """
     get_pipeline(spirv_bytes, entry_name, push_constant_size) -> VkComputePipeline
@@ -22,6 +70,9 @@ function get_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String,
     if cached !== nothing
         return cached
     end
+
+    # Validate SPIR-V before sending to driver to prevent segfaults
+    _validate_spirv(spirv_bytes)
 
     dev = vk_device()
 
