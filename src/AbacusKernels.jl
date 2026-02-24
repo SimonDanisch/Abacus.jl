@@ -195,6 +195,9 @@ end
     AbacusDeviceArray{T, length(Dims)}(Dims, reinterpret(Ptr{T}, ptr))
 end
 
+# CPU backend: no-op synchronization (sequential execution on host).
+# The Vulkan backend has its own @vk_device_override with vk_workgroup_barrier()
+# on a separate method table, so these don't conflict.
 @device_override @inline function KA.__synchronize()
     nothing
 end

@@ -10,6 +10,9 @@ using GPUArrays
 using GPUArraysCore
 using Libdl
 using LLD_jll
+using Vulkan
+using SPIRV_LLVM_Backend_jll
+using SPIRV_Tools_jll
 
 import KernelAbstractions
 
@@ -41,6 +44,26 @@ include("AbacusKernels.jl")
 import .AbacusKernels: AbacusBackend
 
 export AbacusBackend, AbacusArray, AbacusVector, AbacusMatrix, AbacusDeviceArray, @abacus
+
+# Vulkan backend
+include("vulkan/init.jl")
+include("vulkan/memory.jl")
+include("vulkan/array.jl")
+include("vulkan/intrinsics.jl")
+include("vulkan/spirv_fixup.jl")
+include("vulkan/pipeline.jl")
+include("vulkan/compilation.jl")
+include("vulkan/commands.jl")
+include("vulkan/execution.jl")
+include("vulkan/mapreduce.jl")
+
+export VkContext, VkArray, VkVector, VkMatrix, VkDeviceArray, VkPtr, @vulkan
+
+# KernelAbstractions Vulkan backend
+include("vulkan/VulkanKernels.jl")
+import .VulkanKernels: VulkanBackend
+
+export VulkanBackend
 
 function __init__()
     # Allocate a fresh per-thread kernel state buffer. This must run at module-load

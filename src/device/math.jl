@@ -26,7 +26,7 @@ for (jlfun, llvmfun) in [
     # Intrinsic name suffix: Float32 → "f32", Float16 → "f16"
     for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16")]
         llvm_name = "$(llvmfun).$(suffix)"
-        @eval @device_override @inline $jlfun(x::$T) = Base.llvmcall(
+        @eval @shared_device_override @inline $jlfun(x::$T) = Base.llvmcall(
             ($("declare $llvm_type @$llvm_name($llvm_type)\ndefine $llvm_type @entry($llvm_type %0) {\n  %r = call $llvm_type @$llvm_name($llvm_type %0)\n  ret $llvm_type %r\n}"), "entry"),
             $T, Tuple{$T}, x)
     end
@@ -34,29 +34,40 @@ end
 
 # pow(Float32, Float32) via llvm.pow
 for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16")]
-    @eval @device_override @inline Base.:(^)(x::$T, y::$T) = Base.llvmcall(
+    @eval @shared_device_override @inline Base.:(^)(x::$T, y::$T) = Base.llvmcall(
         ($("declare $llvm_type @llvm.pow.$suffix($llvm_type, $llvm_type)\ndefine $llvm_type @entry($llvm_type %0, $llvm_type %1) {\n  %r = call $llvm_type @llvm.pow.$suffix($llvm_type %0, $llvm_type %1)\n  ret $llvm_type %r\n}"), "entry"),
         $T, Tuple{$T, $T}, x, y)
 end
 
 # fma via llvm.fma
 for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16")]
-    @eval @device_override @inline Base.fma(a::$T, b::$T, c::$T) = Base.llvmcall(
+    @eval @shared_device_override @inline Base.fma(a::$T, b::$T, c::$T) = Base.llvmcall(
         ($("declare $llvm_type @llvm.fma.$suffix($llvm_type, $llvm_type, $llvm_type)\ndefine $llvm_type @entry($llvm_type %0, $llvm_type %1, $llvm_type %2) {\n  %r = call $llvm_type @llvm.fma.$suffix($llvm_type %0, $llvm_type %1, $llvm_type %2)\n  ret $llvm_type %r\n}"), "entry"),
         $T, Tuple{$T, $T, $T}, a, b, c)
 end
 
-# copysign via llvm.copysign
+# copysign via llvm.copysign — CPU backend only.
+# llc crashes on G_FCOPYSIGN for Vulkan SPIR-V, so Vulkan gets a pure-Julia version below.
 for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16")]
     @eval @device_override @inline Base.copysign(x::$T, y::$T) = Base.llvmcall(
         ($("declare $llvm_type @llvm.copysign.$suffix($llvm_type, $llvm_type)\ndefine $llvm_type @entry($llvm_type %0, $llvm_type %1) {\n  %r = call $llvm_type @llvm.copysign.$suffix($llvm_type %0, $llvm_type %1)\n  ret $llvm_type %r\n}"), "entry"),
         $T, Tuple{$T, $T}, x, y)
 end
 
+# copysign — Vulkan backend: pure-Julia (no llvm.copysign, llc can't select G_FCOPYSIGN)
+@vk_device_override @inline function Base.copysign(x::Float32, y::Float32)
+    ax = abs(x)
+    return y < 0f0 ? -ax : ax
+end
+@vk_device_override @inline function Base.copysign(x::Float16, y::Float16)
+    ax = abs(x)
+    return y < Float16(0) ? -ax : ax
+end
+
 ### Pure-Julia Float32 implementations (copied from Metal.jl)
 
 # Avoid Float64 in pow(Float32, Integer)
-@device_override @inline function Base.:(^)(x::Float32, y::Integer)
+@shared_device_override @inline function Base.:(^)(x::Float32, y::Integer)
     y == -1 && return inv(x)
     y == 0 && return one(x)
     y == 1 && return x
@@ -64,7 +75,7 @@ end
     y == 3 && return x * x * x
     x^Float32(y)
 end
-@device_override @inline function Base.:(^)(x::Float16, y::Integer)
+@shared_device_override @inline function Base.:(^)(x::Float16, y::Integer)
     y == -1 && return inv(x)
     y == 0 && return one(x)
     y == 1 && return x
@@ -89,8 +100,8 @@ end
     r = b / a
     return a * sqrt(one(T) + r * r)
 end
-@device_override Base.hypot(x::Float32, y::Float32) = _hypot(x, y)
-@device_override Base.hypot(x::Float16, y::Float16) = _hypot(x, y)
+@shared_device_override Base.hypot(x::Float32, y::Float32) = _hypot(x, y)
+@shared_device_override Base.hypot(x::Float16, y::Float16) = _hypot(x, y)
 
 # log1p(Float32) — from Metal.jl (openlibm's log1pf)
 const _ln2_hi = 0.6931381f0
@@ -103,7 +114,7 @@ const _Lp5 = 0.18183573f0
 const _Lp6 = 0.15313838f0
 const _Lp7 = 0.14798199f0
 
-@device_override function Base.Math.log1p(x::Float32)
+@shared_device_override function Base.Math.log1p(x::Float32)
     hx = reinterpret(Int32, x)
     ax = hx & 0x7fffffff
 
@@ -189,7 +200,7 @@ const _Lp7 = 0.14798199f0
 end
 
 # expm1(Float32) — from Metal.jl (Norbert Juffa)
-@device_override function Base.expm1(a::Float32)
+@shared_device_override function Base.expm1(a::Float32)
     j = fma(1.442695f0, a, 12582912.0f0)
     j = j - 12582912.0f0
     i = unsafe_trunc(Int32, j)
@@ -233,13 +244,14 @@ end
 ### Integer: _mul_high override to avoid i128
 # Julia's _mul_high uses i128 for the multiplication. Metal provides hardware mul_hi.
 # On x86, we implement _mul_high without i128 using inline assembly or widening multiply.
+# SPIR-V/Vulkan doesn't support i128 at all (llc crashes), so the Vulkan backend gets
+# a pure-Julia implementation using 32-bit multiply-add decomposition.
 
 @static if isdefined(Base, :mul_hi) # Julia >= 1.13
     # Use Base.mul_hi which should be available
 else
-    # Override _mul_high to avoid i128 — use llvmcall for widening multiply
+    # CPU backend: i128 widening multiply via llvmcall (works on x86)
     @device_override function Base.MultiplicativeInverses._mul_high(a::Int64, b::Int64)
-        # Use LLVM's mul instruction with sext to i128, then shift right
         Base.llvmcall(
             ("""define i64 @entry(i64 %a, i64 %b) {
                 %a_wide = sext i64 %a to i128
@@ -262,5 +274,27 @@ else
                 ret i64 %result
             }""", "entry"),
             UInt64, Tuple{UInt64, UInt64}, a, b)
+    end
+
+    # Vulkan backend: pure-Julia _mul_high (no i128 — SPIR-V doesn't support it).
+    # Decomposes 64-bit multiply into four 32-bit multiplies.
+    @vk_device_override function Base.MultiplicativeInverses._mul_high(a::UInt64, b::UInt64)
+        a_lo = a % UInt32; a_hi = (a >> 32) % UInt32
+        b_lo = b % UInt32; b_hi = (b >> 32) % UInt32
+        lo_lo = UInt64(a_lo) * UInt64(b_lo)
+        lo_hi = UInt64(a_lo) * UInt64(b_hi)
+        hi_lo = UInt64(a_hi) * UInt64(b_lo)
+        hi_hi = UInt64(a_hi) * UInt64(b_hi)
+        mid = (lo_lo >> 32) + (lo_hi % UInt32(0xffffffff)) + (hi_lo % UInt32(0xffffffff))
+        return hi_hi + (lo_hi >> 32) + (hi_lo >> 32) + (mid >> 32)
+    end
+    @vk_device_override function Base.MultiplicativeInverses._mul_high(a::Int64, b::Int64)
+        # Signed: compute unsigned high word, then adjust for signs
+        hi = Base.MultiplicativeInverses._mul_high(reinterpret(UInt64, a), reinterpret(UInt64, b))
+        # Correction: if a < 0, subtract b from high; if b < 0, subtract a from high
+        result = reinterpret(Int64, hi)
+        if a < 0; result -= b; end
+        if b < 0; result -= a; end
+        return result
     end
 end
