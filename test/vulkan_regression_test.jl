@@ -156,29 +156,98 @@ import AcceleratedKernels
     end
 
     # =====================================================================
-    # Known blocked operations (uncomment as they get fixed):
-    #
-    # BUG: AK.sort! — compiles and runs but produces wrong results.
-    #   Likely shared memory synchronization issue in merge sort kernel.
-    #   The structured CF issues are fixed (llc -O0 + _fix_merge_placement!).
-    #
-    # BUG: AK.searchsortedfirst — llc crashes with "PHINode should have one
-    #   entry for each predecessor". Our LLVM passes produce invalid IR for
-    #   the searchsortedfirst kernel's complex CF patterns.
-    #
-    # BUG: AK.accumulate!/cumsum — compiles and runs but produces NaN.
-    #   No longer crashes RADV (structured CF fixed), but correctness issue
-    #   remains — likely shared memory or barrier synchronization problem.
-    #
-    # @testset "AK.sort!" begin
-    #     v = VkArray(Float32[3,1,4,1,5,9,2,6])
-    #     AcceleratedKernels.sort!(v)
-    #     @test Array(v) == Float32[1,1,2,3,4,5,6,9]
-    # end
-    #
-    # @testset "AK.accumulate!" begin
-    #     v = VkArray(Float32[1,2,3,4,5])
-    #     AcceleratedKernels.accumulate!(+, v; init=0f0)
-    #     @test Array(v) ≈ Float32[1,3,6,10,15]
-    # end
+    # BUG: AK.accumulate! produced NaN due to two shared memory GEP issues:
+    #   Pattern A: ConstantExpr GEP bases with negative indices — LLVM folds
+    #     GEP(@shared, 0, i-1) into GEP(ConstGEP(@shared, -1, N-1), i).
+    #     SPIR-V OpAccessChain cannot represent negative array indices.
+    #   Pattern B: Flat GEP chains on addrspace(3) — GEP(T, %structured_gep, offset)
+    #     silently breaks in the SPIR-V backend.
+    # FIX: _fix_shared_geps! in compilation.jl rewrites both patterns into
+    # structured GEPs with correct non-negative indices.
+    @testset "AcceleratedKernels accumulate!" begin
+        v = VkArray(Float32[1,2,3,4,5])
+        AcceleratedKernels.accumulate!(+, v; init=0f0)
+        @test Array(v) ≈ Float32[1,3,6,10,15]
+
+        # Large accumulate (tests multi-block Blelloch scan)
+        h = rand(Float32, 50_000)
+        g = VkArray(copy(h))
+        AcceleratedKernels.accumulate!(+, g; init=0f0)
+        @test isapprox(Array(g), cumsum(h); rtol=1e-3)
+    end
+
+    # =====================================================================
+    # BUG: AK.sort! crashed with LLVM freeze instruction not supported by
+    #   SPIR-V backend (IRTranslator::translateFreeze). Also produced wrong
+    #   results due to the shared memory GEP issues described above.
+    # FIX: _replace_freeze! in compilation.jl replaces freeze instructions
+    # with their operands (safe — SPIR-V has no poison/undef semantics).
+    # Shared memory fixes (Pattern A + B) fixed correctness.
+    @testset "AcceleratedKernels sort!" begin
+        v = VkArray(Float32[3,1,4,1,5,9,2,6])
+        AcceleratedKernels.sort!(v)
+        @test Array(v) == Float32[1,1,2,3,4,5,6,9]
+
+        # Medium sort
+        h = rand(Float32, 10_000)
+        g = VkArray(copy(h))
+        AcceleratedKernels.sort!(g)
+        @test Array(g) == sort(h)
+
+        # Large sort
+        h2 = rand(Float32, 100_000)
+        g2 = VkArray(copy(h2))
+        AcceleratedKernels.sort!(g2)
+        @test Array(g2) ≈ sort(h2)
+    end
+
+    # =====================================================================
+    @testset "AcceleratedKernels sortperm!" begin
+        h = rand(Float32, 1000)
+        g = VkArray(copy(h))
+        ix = VkArray(collect(1:1000))
+        AcceleratedKernels.sortperm!(ix, g)
+        @test Array(ix) == sortperm(h)
+    end
+
+    # =====================================================================
+    @testset "AcceleratedKernels merge_sort_by_key!" begin
+        keys_h = rand(Float32, 5000)
+        vals_h = collect(Int32, 1:5000)
+        keys_g = VkArray(copy(keys_h))
+        vals_g = VkArray(copy(vals_h))
+        AcceleratedKernels.merge_sort_by_key!(keys_g, vals_g)
+        perm = sortperm(keys_h)
+        @test isapprox(Array(keys_g), keys_h[perm])
+        @test Array(vals_g) == Int32.(vals_h[perm])
+    end
+
+    # =====================================================================
+    @testset "AcceleratedKernels searchsortedfirst" begin
+        sorted = VkArray(Float32.(1:100))
+        needles = VkArray(Float32[5.5, 10.0, 50.5, 99.0])
+        result = AcceleratedKernels.searchsortedfirst(sorted, needles)
+        expected = [searchsortedfirst(Float32.(1:100), n) for n in Float32[5.5, 10.0, 50.5, 99.0]]
+        @test Array(result) == expected
+    end
+
+    # =====================================================================
+    @testset "KernelAbstractions matmul" begin
+        import KernelAbstractions as KA
+        @kernel function matmul_kernel!(output, a, b)
+            i, j = @index(Global, NTuple)
+            tmp_sum = zero(eltype(output))
+            for k in 1:size(a)[2]
+                tmp_sum += a[i, k] * b[k, j]
+            end
+            output[i, j] = tmp_sum
+        end
+        backend = Abacus.VulkanKernels.VulkanBackend()
+        a = VkArray(rand(Float32, 64, 32))
+        b = VkArray(rand(Float32, 32, 16))
+        output = KA.zeros(backend, Float32, 64, 16)
+        matmul_kernel!(backend)(output, a, b, ndrange=(64, 16))
+        KA.synchronize(backend)
+        @test isapprox(Array(output), Array(a) * Array(b))
+    end
 end

@@ -222,16 +222,29 @@ end
 
 Base.size(a::VkDeviceArray) = a.dims
 
-Base.@propagate_inbounds function Base.getindex(a::VkDeviceArray{T}, i::Integer) where T
-    @boundscheck checkbounds(a, i)
+@inline function Base.getindex(a::VkDeviceArray{T}, i::Integer) where T
+    # No bounds checking on device — GPU can't throw exceptions, and the
+    # error paths from @boundscheck create IR patterns (shared error blocks
+    # inside loops) that StructurizeCFG cannot handle correctly.
     addr = a.ptr + ((i % UInt64) - UInt64(1)) * UInt64(sizeof(T))
     return unsafe_load(Core.LLVMPtr{T, 1}(addr))
 end
 
-Base.@propagate_inbounds function Base.setindex!(a::VkDeviceArray{T}, v, i::Integer) where T
-    @boundscheck checkbounds(a, i)
+@inline function Base.setindex!(a::VkDeviceArray{T}, v, i::Integer) where T
     addr = a.ptr + ((i % UInt64) - UInt64(1)) * UInt64(sizeof(T))
     unsafe_store!(Core.LLVMPtr{T, 1}(addr), convert(T, v))
+    return a
+end
+
+# Override multi-arg indexing to skip bounds checking.
+# Base.getindex(A::AbstractArray, I...) calls @boundscheck checkbounds(A, I...)
+# which generates error paths that break StructurizeCFG on GPU.
+@inline function Base.getindex(a::VkDeviceArray, I::Integer...)
+    @inbounds a[Base._to_linear_index(a, I...)]
+end
+
+@inline function Base.setindex!(a::VkDeviceArray, v, I::Integer...)
+    @inbounds a[Base._to_linear_index(a, I...)] = v
     return a
 end
 

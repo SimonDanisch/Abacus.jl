@@ -156,6 +156,7 @@ function vkcompile(@nospecialize(job::GPUCompiler.CompilerJob))
         # own rm_trap!. Must happen BEFORE SimplifyCFG/StructurizeCFG.
         GPUCompiler.rm_trap!(mod)
         _replace_unreachable!(mod)
+        _replace_freeze!(mod)
         _strip_noreturn!(mod)
         _strip_assume!(mod)
 
@@ -164,6 +165,15 @@ function vkcompile(@nospecialize(job::GPUCompiler.CompilerJob))
         # OpSelectionMerge instructions targeting the same block, which is
         # invalid in Vulkan SPIR-V ("Block is already a merge block").
         LLVM.run!(LLVM.SimplifyCFGPass(), mod)
+
+        # Isolate shared merge targets BEFORE StructurizeCFG.
+        # When a block is the target of multiple conditional branches (e.g.,
+        # an error path reachable from both a loop preheader and the loop body),
+        # StructurizeCFG can't structurize the loop correctly — it replaces the
+        # back-edge condition with `true`, causing the loop to exit after one
+        # iteration. Inserting trampolines gives each construct its own unique
+        # exit target, like clspv's FixupStructuredCFGPass.
+        _fixup_structured_cfg!(mod)
 
         # Structurize CFG for Vulkan SPIR-V compliance.
         # Vulkan requires structured control flow (no irreducible loops,
@@ -174,10 +184,6 @@ function vkcompile(@nospecialize(job::GPUCompiler.CompilerJob))
         LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod)
         LLVM.run!(LLVM.FixIrreduciblePass(), mod)
         LLVM.run!(LLVM.StructurizeCFGPass(), mod)
-
-        # Fix structured CFG: ensure no basic block is the merge target of
-        # multiple SPIR-V constructs. Like clspv's FixupStructuredCFGPass.
-        _fixup_structured_cfg!(mod)
 
         # StructurizeCFG introduces reg2mem (alloca+load+store) patterns.
         # InstCombine cleans up bitcasts that crash llc's "SPIRV legalize bitcast pass".
@@ -718,6 +724,29 @@ function _strip_assume!(mod::LLVM.Module)
 end
 
 """
+Replace `freeze` instructions with their operands.
+
+The LLVM SPIR-V backend does not support the `freeze` instruction
+(crashes in IRTranslator::translateFreeze). `freeze` makes poison/undef
+values deterministic, but SPIR-V has no poison/undef semantics, so we
+can safely replace `freeze %x` with `%x`.
+"""
+function _replace_freeze!(mod::LLVM.Module)
+    for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+        to_erase = LLVM.Instruction[]
+        for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+            inst isa LLVM.FreezeInst || continue
+            LLVM.replace_uses!(inst, LLVM.operands(inst)[1])
+            push!(to_erase, inst)
+        end
+        for inst in to_erase
+            LLVM.erase!(inst)
+        end
+    end
+end
+
+"""
     _fixup_structured_cfg!(mod::LLVM.Module)
 
 Post-StructurizeCFG fixup pass, analogous to clspv's `FixupStructuredCFGPass`.
@@ -750,6 +779,10 @@ function _isolate_shared_merge_targets!(f::LLVM.Function)
         term isa LLVM.BrInst || continue
         LLVM.isconditional(term) || continue
         for succ in LLVM.successors(term)
+            # Skip self-loops (loop back-edges). These are handled correctly by
+            # the SPIR-V backend as OpLoopMerge, not OpSelectionMerge. Including
+            # them creates dead trampoline blocks that break PHI node invariants.
+            succ == bb && continue
             sources = get!(cond_sources, succ, LLVM.BasicBlock[])
             # Avoid counting the same source twice (both branches to same target)
             bb in sources || push!(sources, bb)
@@ -952,6 +985,144 @@ function _fix_shared_geps!(mod::LLVM.Module)
         end
 
         for bb in LLVM.blocks(f)
+            # Part 0: Fix negative-index GEPs on shared memory (addrspace 3).
+            #
+            # LLVM generates negative-index GEPs on shared memory pointers in
+            # two patterns, both from Julia's 1-based `unsafe_load(ptr, i)`:
+            #
+            # Pattern A: ConstantExpr GEP base with negative array index
+            #   GEP(T, ConstGEP([N x T], @shared, -1, N-1), %k)
+            #   → GEP([N x T], @shared, 0, %k + (-1*N + N-1))
+            #
+            # Pattern B: GEP chain with constant -1 offset
+            #   %a = GEP(T, @shared, %idx)
+            #   %b = GEP(T, %a, -1)
+            #   → GEP(T, @shared, %idx - 1)
+            #
+            # SPIR-V's OpAccessChain cannot represent negative constant indices.
+            # Fix all patterns by folding into non-negative GEPs from the base.
+
+            # Pattern A: ConstantExpr GEP bases
+            constexpr_fixes = Tuple{LLVM.GetElementPtrInst, LLVM.Value, LLVM.LLVMType, Int}[]
+            for inst in LLVM.instructions(bb)
+                inst isa LLVM.GetElementPtrInst || continue
+                ops = LLVM.operands(inst)
+                length(ops) == 2 || continue
+                ptr_op = ops[1]
+                ptr_op isa LLVM.ConstantExpr || continue
+                LLVM.API.LLVMGetConstOpcode(ptr_op) == LLVM.API.LLVMGetElementPtr || continue
+                ce_ops = LLVM.operands(ptr_op)
+                length(ce_ops) >= 3 || continue
+                gv = ce_ops[1]
+                haskey(shared_globals, gv) || continue
+                arr_idx = ce_ops[2]
+                elem_idx = ce_ops[3]
+                arr_idx isa LLVM.ConstantInt || continue
+                elem_idx isa LLVM.ConstantInt || continue
+                a = convert(Int, arr_idx)
+                b = convert(Int, elem_idx)
+                arr_ty = shared_globals[gv]
+                N = length(arr_ty)
+                offset = a * N + b
+                push!(constexpr_fixes, (inst, gv, arr_ty, offset))
+            end
+
+            if !isempty(constexpr_fixes)
+                ncz = _get_nonconst_zero!()
+                zero_const = LLVM.ConstantInt(T_i64, 0)
+                LLVM.IRBuilder() do builder
+                    for (gep, gv, arr_ty, offset) in constexpr_fixes
+                        LLVM.position!(builder, gep)
+                        dyn_idx = LLVM.operands(gep)[2]
+                        adj_idx = if offset == 0
+                            dyn_idx
+                        else
+                            LLVM.add!(builder, dyn_idx,
+                                     LLVM.ConstantInt(LLVM.value_type(dyn_idx), offset),
+                                     "shmem_adj_idx")
+                        end
+                        if LLVM.value_type(adj_idx) != T_i64
+                            adj_idx = LLVM.sext!(builder, adj_idx, T_i64, "shmem_idx64")
+                        end
+                        new_gep = LLVM.gep!(builder, arr_ty, gv,
+                                           LLVM.Value[zero_const, adj_idx],
+                                           LLVM.name(gep) == "" ? "shmem_gep.fix" : LLVM.name(gep) * ".fix")
+                        LLVM.replace_uses!(gep, new_gep)
+                        LLVM.erase!(gep)
+                    end
+                end
+            end
+
+            # Pattern B: Flat GEP chains on addrspace(3) GEP results.
+            # The SPIR-V backend cannot translate flat GEPs (element-type based)
+            # on Workgroup pointers into valid OpAccessChain. Merge flat GEPs
+            # into the preceding structured GEP by adding the offset to the
+            # last index. Like clspv's SimplifyPointerBitcastPass::runOnGEPFromGEP.
+            #
+            # Before: %a = GEP [N x T], @shared, 0, %idx
+            #         %b = GEP T, %a, %offset
+            # After:  %b = GEP [N x T], @shared, 0, (%idx + %offset)
+            #
+            # Run in a loop since fixing one GEP may expose another chain.
+            # Only collect GEPs whose base is NOT also being fixed (to avoid
+            # invalidation when we erase replaced GEPs).
+            changed = true
+            while changed
+                changed = false
+                chain_fixes = Tuple{LLVM.GetElementPtrInst, LLVM.GetElementPtrInst, LLVM.Value}[]
+                # First pass: collect all candidates
+                candidates = Set{LLVM.GetElementPtrInst}()
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.GetElementPtrInst || continue
+                    ops = LLVM.operands(inst)
+                    length(ops) == 2 || continue
+                    ptr_op = ops[1]
+                    ptr_op isa LLVM.GetElementPtrInst || continue
+                    ptr_ty = LLVM.value_type(ptr_op)
+                    ptr_ty isa LLVM.PointerType || continue
+                    LLVM.addrspace(ptr_ty) == 3 || continue
+                    push!(candidates, inst)
+                end
+                # Second pass: only fix GEPs whose base is NOT also a candidate
+                # (process leaves first to avoid erasing bases)
+                for inst in candidates
+                    base = LLVM.operands(inst)[1]::LLVM.GetElementPtrInst
+                    base in candidates && continue  # skip if base will also be fixed
+                    push!(chain_fixes, (inst, base, LLVM.operands(inst)[2]))
+                end
+
+                if !isempty(chain_fixes)
+                    changed = true
+                    LLVM.IRBuilder() do builder
+                        for (gep, base_gep, offset_val) in chain_fixes
+                            LLVM.position!(builder, gep)
+                            base_idx = LLVM.operands(base_gep)[end]
+                            idx_ty = LLVM.value_type(base_idx)
+                            off_ty = LLVM.value_type(offset_val)
+                            if off_ty != idx_ty
+                                if idx_ty == T_i64
+                                    offset_val = LLVM.sext!(builder, offset_val, T_i64, "shmem_off64")
+                                else
+                                    base_idx = LLVM.sext!(builder, base_idx, T_i64, "shmem_base64")
+                                    idx_ty = T_i64
+                                end
+                            end
+                            adj_idx = LLVM.add!(builder, base_idx, offset_val,
+                                               "shmem_chain_adj")
+                            src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(base_gep))
+                            base_ptr = LLVM.operands(base_gep)[1]
+                            base_ops = LLVM.operands(base_gep)
+                            new_indices = LLVM.Value[base_ops[i] for i in 2:length(base_ops)-1]
+                            push!(new_indices, adj_idx)
+                            new_gep = LLVM.gep!(builder, src_ty, base_ptr, new_indices,
+                                               LLVM.name(gep) == "" ? "shmem_chain.fix" : LLVM.name(gep) * ".fix")
+                            LLVM.replace_uses!(gep, new_gep)
+                            LLVM.erase!(gep)
+                        end
+                    end
+                end
+            end
+
             # Part 1: Fix flat instruction GEPs
             to_fix = Tuple{LLVM.GetElementPtrInst, LLVM.LLVMType}[]
             for inst in LLVM.instructions(bb)
