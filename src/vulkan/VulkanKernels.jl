@@ -2,7 +2,7 @@ module VulkanKernels
 
 using ..Abacus
 using ..Abacus: @vk_device_override, VkArray, VkDeviceArray, VkPtr,
-    kernel_convert_ka, vkfunction, _pack_push_constants, vk_dispatch!
+    kernel_convert_ka, vkfunction, _pack_push_constants, vk_dispatch!, vk_flush!
 
 import KernelAbstractions as KA
 import Adapt
@@ -18,7 +18,7 @@ struct VulkanBackend <: KA.GPU end
     VkArray{T, length(dims)}(undef, dims)
 
 KA.get_backend(::VkArray) = VulkanBackend()
-KA.synchronize(::VulkanBackend) = nothing   # dispatch is blocking
+KA.synchronize(::VulkanBackend) = vk_flush!()
 
 KA.supports_float64(::VulkanBackend) = true
 KA.supports_atomics(::VulkanBackend) = false

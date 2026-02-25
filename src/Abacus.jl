@@ -57,7 +57,7 @@ include("vulkan/commands.jl")
 include("vulkan/execution.jl")
 include("vulkan/mapreduce.jl")
 
-export VkContext, VkArray, VkVector, VkMatrix, VkDeviceArray, VkPtr, @vulkan
+export VkContext, VkArray, VkVector, VkMatrix, VkDeviceArray, VkPtr, @vulkan, vk_flush!
 
 # KernelAbstractions Vulkan backend
 include("vulkan/VulkanKernels.jl")

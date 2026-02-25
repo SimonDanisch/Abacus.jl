@@ -136,45 +136,72 @@ All text fixups are blocked on upstream LLVM SPIR-V backend limitations:
 - `AK.reduce` — all sizes (after derive offset fix #6)
 - `AK.sum` / `AK.prod` / `AK.maximum` / `AK.minimum` / `AK.count`
 - `AK.mapreduce`
+- `AK.sort!` / `AK.sortperm` / `AK.sortperm!`
+- `AK.accumulate` / `AK.cumsum`
+- `AK.searchsortedfirst`
+- `AK.any` / `AK.all`
 
-### Blocked AK Operations
+### AcceleratedKernels Benchmarks (Vulkan vs AMDGPU, with async batch dispatch)
 
-| Operation | Error | Root Cause |
-|-----------|-------|------------|
-| `AK.sort!` | spirv-val: "Block is already a merge block for another header" | Structured CF: complex merge sort with while+conditionals+barriers produces invalid merge block nesting. LLVM StructurizeCFG doesn't fully handle this. |
-| `AK.accumulate!` / `AK.cumsum` | Segfault in `vkCreateComputePipelines` (RADV) | SPIR-V passes spirv-val but crashes RADV shader compiler. Driver bug. |
-| `AK.searchsortedfirst` | spirv-val: "Block is already a merge block for another header" | Same structured CF issue as sort (binary search loop pattern). |
-| `AK.any` / `AK.all` | spirv-val: "OpVariable initializers limited to OpConstantNull in Workgroup" | Shared memory variables have non-null initializers. Need to zero-initialize in SPIR-V fixup or change how @localmem emits initializers. |
-
-### AcceleratedKernels Benchmarks (Vulkan vs AMDGPU)
+GPU: AMD Radeon RX 7900 XTX — Vulkan (RADV NAVI31) vs AMDGPU (ROCm)
 
 ```
-Operation              N         Vulkan     AMDGPU     Ratio
-foreachindex           1,024     50us       31us       1.62x slower
-foreachindex           10,000    47us       30us       1.56x slower
-foreachindex           100,000   46us       30us       1.53x slower
-foreachindex           1,000,000 58us       38us       1.54x slower
-map!                   1,024     51us       31us       1.62x slower
-map!                   10,000    48us       29us       1.64x slower
-map!                   100,000   48us       30us       1.59x slower
-map!                   1,000,000 58us       43us       1.37x slower
-reduce (+)             1,024     154us      58us       2.65x slower
-reduce (+)             10,000    161us      57us       2.81x slower
-reduce (+)             100,000   155us      59us       2.63x slower
-reduce (+)             1,000,000 210us      72us       2.90x slower
-sum                    1,024     153us      59us       2.60x slower
-sum                    10,000    155us      61us       2.54x slower
-sum                    100,000   156us      60us       2.59x slower
-sum                    1,000,000 211us      73us       2.88x slower
-mapreduce (x^2, +)     1,024     160us      60us       2.65x slower
-mapreduce (x^2, +)     10,000    161us      61us       2.66x slower
-mapreduce (x^2, +)     100,000   158us      60us       2.66x slower
-mapreduce (x^2, +)     1,000,000 212us      74us       2.85x slower
+Operation                              Vulkan       AMDGPU       Ratio
+── Reductions ──
+reduce N=10,000                         175 μs       65 μs       2.70x
+reduce N=100,000                        174 μs       64 μs       2.71x
+reduce N=1,000,000                      240 μs       78 μs       3.10x
+reduce N=10,000,000                     272 μs      165 μs       1.65x
+
+── MapReduce ──
+mapreduce N=10,000                      175 μs       65 μs       2.70x
+mapreduce N=100,000                     173 μs       64 μs       2.70x
+mapreduce N=1,000,000                   240 μs       78 μs       3.07x
+mapreduce N=10,000,000                  285 μs      176 μs       1.62x
+
+── Accumulate (prefix sum) ──
+accumulate N=10,000                     294 μs       67 μs       4.38x
+accumulate N=100,000                    369 μs      113 μs       3.26x
+accumulate N=1,000,000                 1230 μs      468 μs       2.64x
+
+── Sort ──
+sort N=1,000                            300 μs      102 μs       2.93x
+sort N=10,000                           576 μs      163 μs       3.53x
+sort N=100,000                          859 μs      486 μs       1.77x
+sort N=1,000,000                       3430 μs     3820 μs       0.90x  ← Vulkan FASTER
+
+── Sortperm ──
+sortperm N=1,000                        417 μs      158 μs       2.64x
+sortperm N=10,000                       723 μs      341 μs       2.12x
+sortperm N=100,000                     1220 μs      625 μs       1.96x
+
+── SearchSortedFirst ──
+searchsortedfirst N=100K, M=10K          75 μs       42 μs       1.77x
+searchsortedfirst N=1M, M=100K          107 μs       78 μs       1.37x
+
+── Foreachindex ──
+foreachindex N=10,000                   112 μs       45 μs       2.47x
+foreachindex N=100,000                  180 μs       90 μs       2.00x
+foreachindex N=1,000,000               1020 μs      562 μs       1.81x
+foreachindex N=10,000,000             38850 μs    19930 μs       1.95x
+
+── Any ──
+any N=10,000                            156 μs       61 μs       2.55x
+any N=100,000                           168 μs       64 μs       2.64x
+any N=1,000,000                         175 μs       85 μs       2.05x
+
+── KA Matmul ──
+matmul 128×128                          111 μs       90 μs       1.24x
+matmul 256×256                          182 μs      290 μs       0.63x  ← Vulkan FASTER
+matmul 512×512                          433 μs     1590 μs       0.27x  ← Vulkan FASTER
 ```
 
-**Analysis**: Simple element-wise ops (foreachindex, map) are ~1.5x slower — dominated
-by dispatch overhead (~47us Vulkan vs ~30us AMDGPU). Reductions are ~2.7x slower due to
-multi-pass design requiring multiple dispatches (each with ~150us total).
+**Analysis**: Async batch dispatch (commands.jl) records all dispatches into a single
+command buffer with compute→compute memory barriers, submitting only at sync points
+(flush/copy). This eliminated ~46μs per-dispatch fence overhead. Key wins:
+- **Sort 1M: Vulkan beats AMDGPU** (3.4ms vs 3.8ms) — 156 dispatches batched into one submit
+- Matmul: Vulkan 2-4x faster at 256+ (single dispatch, compute-bound)
+- Reduce/mapreduce: still ~2-3x slower at small N (dominated by fixed dispatch cost)
 
 ### Known Issues
 - Raw `@vulkan`-style kernels (bypassing KA) have a pointer indexing issue:
@@ -184,7 +211,6 @@ multi-pass design requiring multiple dispatches (each with ~150us total).
 
 ### Pending
 - **AcceleratedKernels-Benchmark** repo benchmarks (RBF kernel, LJG potential)
-- Fix `AK.any`/`AK.all` — shared memory initializer issue (may be fixable in spirv_fixup)
 - Investigate reduce dispatch overhead (2.7x ratio vs 1.5x for simple ops)
 
 ---

@@ -15,6 +15,9 @@ mutable struct VkContext
     # Pre-allocated dispatch resources (reused every vk_dispatch!)
     cmd_buf::Vulkan.CommandBuffer
     fence::Vulkan.Fence
+    # Async dispatch state
+    recording::Bool
+    dispatch_count::Int
 end
 
 const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
@@ -120,7 +123,7 @@ function _init_vulkan!()
     fence = unwrap(Vulkan.create_fence(device))
 
     ctx = VkContext(instance, pd, device, queue, compute_qf, cmd_pool, device_name,
-                    cmd_buf, fence)
+                    cmd_buf, fence, false, 0)
     _vk_context[] = ctx
     return ctx
 end

@@ -1,4 +1,8 @@
 # Command buffer recording and submission for compute dispatch
+#
+# Dispatches are recorded into a single command buffer without submitting.
+# vk_flush!() ends recording, submits the batch, and waits for completion.
+# Memory barriers between dispatches ensure correct read-after-write ordering.
 
 # Pre-built SubmitInfo pointing to the context's reusable command buffer.
 # Allocated once to avoid per-dispatch Vector/struct allocations.
@@ -15,26 +19,44 @@ function _get_submit_info(ctx::VkContext)
     return si
 end
 
+"""Begin recording into the reusable command buffer if not already recording."""
+function _ensure_recording(ctx::VkContext)
+    ctx.recording && return
+    unwrap(Vulkan.begin_command_buffer(ctx.cmd_buf,
+        Vulkan.CommandBufferBeginInfo(;
+            flags = Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+    ctx.recording = true
+    return
+end
+
 """
     vk_dispatch!(pipeline::VkComputePipeline, push_data::Vector{UInt8},
                  groups::NTuple{3,Integer})
 
-Record and submit a compute dispatch command using pre-allocated resources:
-1. Reset and record the reusable command buffer
-2. Bind pipeline, push constants, dispatch
-3. Submit with reusable fence and wait (blocking)
+Record a compute dispatch into the current command buffer (non-blocking).
+A memory barrier is inserted between consecutive dispatches to ensure
+write-after-read correctness. Call `vk_flush!()` to submit and wait.
 """
 function vk_dispatch!(pipeline::VkComputePipeline, push_data::Vector{UInt8},
                       groups::NTuple{3, <:Integer})
     ctx = vk_context()
-    dev = ctx.device
     cmd = ctx.cmd_buf
-    fence = ctx.fence
 
-    # Record into the reusable command buffer (implicitly resets via ONE_TIME_SUBMIT)
-    unwrap(Vulkan.begin_command_buffer(cmd,
-        Vulkan.CommandBufferBeginInfo(;
-            flags = Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+    _ensure_recording(ctx)
+
+    # Barrier between consecutive dispatches (not before the first one)
+    if ctx.dispatch_count > 0
+        barrier = Vulkan.MemoryBarrier(
+            Vulkan.ACCESS_SHADER_WRITE_BIT,
+            Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT)
+        Vulkan.cmd_pipeline_barrier(cmd,
+            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            Vulkan.DependencyFlag(0),
+            [barrier],
+            Vulkan.BufferMemoryBarrier[],
+            Vulkan.ImageMemoryBarrier[])
+    end
 
     Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
 
@@ -48,15 +70,34 @@ function vk_dispatch!(pipeline::VkComputePipeline, push_data::Vector{UInt8},
 
     Vulkan.cmd_dispatch(cmd, UInt32(groups[1]), UInt32(groups[2]), UInt32(groups[3]))
 
-    unwrap(Vulkan.end_command_buffer(cmd))
+    ctx.dispatch_count += 1
 
-    # Submit with reusable fence
+    return nothing
+end
+
+"""
+    vk_flush!()
+
+End command buffer recording, submit the batch, and wait for completion.
+No-op if no dispatches have been recorded.
+"""
+function vk_flush!()
+    ctx = vk_context()
+    ctx.recording || return nothing
+
+    dev = ctx.device
+    fence = ctx.fence
+
+    unwrap(Vulkan.end_command_buffer(ctx.cmd_buf))
+
     submit_info = _get_submit_info(ctx)
     unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence))
 
-    # Wait and reset fence for next use
     unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [fence]))
+
+    ctx.recording = false
+    ctx.dispatch_count = 0
 
     return nothing
 end

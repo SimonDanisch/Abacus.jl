@@ -173,6 +173,7 @@ end
 """Submit a vkCmdCopyBuffer and wait (blocking)."""
 function _submit_copy!(src::Vulkan.Buffer, src_offset::UInt64,
                        dst::Vulkan.Buffer, dst_offset::UInt64, size::UInt64)
+    vk_flush!()  # flush pending compute dispatches before reusing cmd_buf
     ctx = vk_context()
     dev = ctx.device
     cmd = ctx.cmd_buf
