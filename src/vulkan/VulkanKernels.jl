@@ -2,7 +2,7 @@ module VulkanKernels
 
 using ..Abacus
 using ..Abacus: @vk_device_override, VkArray, VkDeviceArray, VkPtr,
-    kernel_convert_ka, vkfunction, _pack_push_constants, vk_dispatch!, vk_flush!
+    kernel_convert_ka, vkfunction, _pack_and_upload_args, vk_dispatch!, vk_flush!
 
 import KernelAbstractions as KA
 import Adapt
@@ -122,6 +122,8 @@ end
 @vk_device_override @inline function Base.isless(x::Float32, y::Float32)
     x < y
 end
+@vk_device_override @inline Base.isless(x::Float64, y::Float64) = x < y
+@vk_device_override @inline Base.isless(x::Float16, y::Float16) = x < y
 
 @vk_device_override @inline function KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
     len = prod(Dims)
@@ -169,9 +171,10 @@ function (obj::KA.Kernel{VulkanBackend})(args...; ndrange=nothing, workgroupsize
     # Convert args: VkArray → VkDeviceArray (supports AbstractArray interface on device)
     converted = map(kernel_convert_ka, args)
 
-    # Build full argument tuple: (ctx, converted_args...)
-    all_args = (ctx, converted...)
-    tt = Tuple{map(Core.Typeof, all_args)...}
+    # Build argument type tuple for compilation (function type is NOT included —
+    # GPUCompiler.methodinstance(typeof(f), tt) adds it implicitly).
+    call_args = (ctx, converted...)
+    tt = Tuple{map(Core.Typeof, call_args)...}
 
     # 1D linearized dispatch (like AMDGPU)
     nblocks = length(KA.blocks(iterspace))
@@ -181,13 +184,17 @@ function (obj::KA.Kernel{VulkanBackend})(args...; ndrange=nothing, workgroupsize
     # Compile (cached via vkfunction)
     kernel = vkfunction(obj.f, tt; workgroup_size=(nthreads, 1, 1))
 
-    # Pack push constants (recursively flattens structs to match LLVM layout)
-    push_data = _pack_push_constants(all_args, kernel.push_size)
+    # Pack args into BDA argument buffer (recursively flattens structs to match LLVM layout).
+    # Include the function object first — the LLVM entry point has it as the
+    # first parameter (before ctx). For non-closure kernels sizeof(f)==0, so
+    # this is a no-op. For closures the captured fields must be at the correct offset.
+    all_args = (obj.f, call_args...)
+    bda_data, arg_buf = _pack_and_upload_args(all_args, kernel.arg_buffer_size)
 
-    # Dispatch
+    # Dispatch (arg_buf kept alive by _keep_alive! until vk_flush!)
     groups = (nblocks, 1, 1)
     GC.@preserve args begin
-        vk_dispatch!(kernel.pipeline, push_data, groups)
+        vk_dispatch!(kernel.pipeline, bda_data, groups)
     end
 
     return nothing

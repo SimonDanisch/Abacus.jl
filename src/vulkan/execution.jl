@@ -26,32 +26,48 @@ macro vulkan(ex...)
         # Compile (cached via vkfunction)
         local kernel = vkfunction(kernel_f, adapted_tt)
 
-        # Pack push constants
-        local push_data = _pack_push_constants(adapted_args, kernel.push_size)
+        # Pack args into BDA argument buffer
+        local bda_data, arg_buf = _pack_and_upload_args(adapted_args, kernel.arg_buffer_size)
 
         # Dispatch
         local ndrange = _infer_ndrange(kernel_args)
         local groups = (cld(ndrange, 64), 1, 1)
 
         GC.@preserve kernel_args begin
-            vk_dispatch!(kernel.pipeline, push_data, groups)
+            vk_dispatch!(kernel.pipeline, bda_data, groups)
         end
 
         nothing
     end
 end
 
-"""Pack kernel arguments into push constant bytes.
-Recursively flattens struct fields so the byte layout matches the
-LLVM push constant struct (which decomposes structs into scalars to
-avoid composite loads that crash RADV)."""
-function _pack_push_constants(args::Tuple, push_size::Int)
-    data = zeros(UInt8, push_size)
+"""Pack kernel arguments into a BDA argument buffer.
+Allocates a device buffer, uploads the packed arguments via staging,
+and registers the buffer to stay alive until the next vk_flush!()."""
+function _pack_and_upload_args(args::Tuple, arg_buffer_size::Int)
+    # Pack args into bytes (same _pack_arg! logic)
+    data = zeros(UInt8, arg_buffer_size)
     offset = Ref(0)
     for arg in args
         _pack_arg!(data, offset, arg)
     end
-    return data
+
+    # Allocate device buffer + upload via staging
+    buf = vk_alloc(arg_buffer_size)
+    GC.@preserve data begin
+        upload!(buf, 0, Ptr{UInt8}(pointer(data)), arg_buffer_size)
+    end
+
+    # Keep buffer alive until GPU finishes (prevents GC-induced GPUVM faults)
+    _keep_alive!(buf)
+
+    # Return BDA as push constant data (8 bytes)
+    bda_data = zeros(UInt8, 8)
+    bda = buf.address
+    GC.@preserve bda_data begin
+        unsafe_store!(Ptr{UInt64}(pointer(bda_data)), bda)
+    end
+    return bda_data, buf
 end
 
 function _pack_arg!(data::Vector{UInt8}, offset::Ref{Int}, arg)

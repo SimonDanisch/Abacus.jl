@@ -290,6 +290,17 @@ end
 Adapt.adapt_storage(::Type{VkArray}, xs::AbstractArray) = convert(VkArray, xs)
 Adapt.adapt_storage(::Type{<:VkArray{T}}, xs::AbstractArray) where {T} = convert(VkArray{T}, xs)
 
+# --- resize! ---
+
+function Base.resize!(a::VkVector{T}, nl::Integer) where {T}
+    b = VkVector{T}(undef, (Int(nl),))
+    copyto!(b, 1, a, 1, min(length(a), nl))
+    a.data = copy(b.data)
+    a.offset = b.offset
+    a.dims = b.dims
+    return a
+end
+
 # --- kernel_convert ---
 kernel_convert(a::VkArray) = device_address(a)
 kernel_convert(x) = x

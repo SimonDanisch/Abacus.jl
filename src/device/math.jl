@@ -39,8 +39,13 @@ for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16
         $T, Tuple{$T, $T}, x, y)
 end
 
-# fma via llvm.fma
-for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16")]
+# No Float64 pow override — GLSL.std.450 transcendentals (Pow, Exp, Log, Sin, Cos, etc.)
+# only support 16/32-bit. No Vulkan extension exists for Float64 transcendentals.
+# Julia's stdlib Float64 pow uses lookup tables → global constant arrays → invalid SPIR-V.
+# Float64 support dropped for now (same limitation as Metal.jl, clspv).
+
+# fma via llvm.fma (GLSL.std.450 Fma DOES support Float64)
+for (T, llvm_type, suffix) in [(Float32, "float", "f32"), (Float16, "half", "f16"), (Float64, "double", "f64")]
     @eval @shared_device_override @inline Base.fma(a::$T, b::$T, c::$T) = Base.llvmcall(
         ($("declare $llvm_type @llvm.fma.$suffix($llvm_type, $llvm_type, $llvm_type)\ndefine $llvm_type @entry($llvm_type %0, $llvm_type %1, $llvm_type %2) {\n  %r = call $llvm_type @llvm.fma.$suffix($llvm_type %0, $llvm_type %1, $llvm_type %2)\n  ret $llvm_type %r\n}"), "entry"),
         $T, Tuple{$T, $T, $T}, a, b, c)
@@ -63,6 +68,10 @@ end
     ax = abs(x)
     return y < Float16(0) ? -ax : ax
 end
+@vk_device_override @inline function Base.copysign(x::Float64, y::Float64)
+    ax = abs(x)
+    return y < 0.0 ? -ax : ax
+end
 
 ### Pure-Julia Float32 implementations (copied from Metal.jl)
 
@@ -82,6 +91,26 @@ end
     y == 2 && return x * x
     y == 3 && return x * x * x
     x^Float16(y)
+end
+@shared_device_override @inline function Base.:(^)(x::Float64, y::Integer)
+    y == -1 && return inv(x)
+    y == 0 && return one(x)
+    y == 1 && return x
+    y == 2 && return x * x
+    y == 3 && return x * x * x
+    # Repeated squaring — no exp/log (GLSL.std.450 transcendentals don't support Float64)
+    neg = y < 0
+    n = neg ? -y : y
+    result = one(x)
+    base = x
+    while n > 0
+        if n & 1 == 1
+            result *= base
+        end
+        base *= base
+        n >>= 1
+    end
+    return neg ? inv(result) : result
 end
 
 # hypot without Float64 (from Metal.jl, originally from Cosmopolitan Libc)

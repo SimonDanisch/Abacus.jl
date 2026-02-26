@@ -33,6 +33,12 @@ const OP_ACCESS_CHAIN      = UInt16(65)
 const OP_DECORATE          = UInt16(71)
 const OP_MEMBER_DECORATE   = UInt16(72)
 const OP_BITCAST           = UInt16(124)
+const OP_IS_NAN            = UInt16(156)
+const OP_IS_INF            = UInt16(157)
+const OP_ORDERED           = UInt16(162)
+const OP_UNORDERED         = UInt16(163)
+const OP_LOGICAL_OR        = UInt16(166)
+const OP_LOGICAL_NOT       = UInt16(168)
 const OP_CONTROL_BARRIER   = UInt16(224)
 const OP_PHI               = UInt16(245)
 const OP_LOOP_MERGE        = UInt16(246)
@@ -54,6 +60,8 @@ const SC_PHYSICAL_STORAGE_BUFFER = UInt32(5349)
 
 const CAP_SHADER                             = UInt32(1)
 const CAP_LINKAGE                            = UInt32(5)
+const CAP_VARIABLE_POINTERS_STORAGE_BUFFER   = UInt32(4441)
+const CAP_VARIABLE_POINTERS                  = UInt32(4442)
 const CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES  = UInt32(5347)
 
 const AM_PHYSICAL_STORAGE_BUFFER_64 = UInt32(5348)
@@ -198,7 +206,7 @@ function fix_capabilities!(mod::SPVModule)
     has_psb = any(mod.insts) do inst
         opcode(inst) == OP_CAPABILITY && inst.words[2] == CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES
     end
-    psb_cap_added = false
+    caps_added = false
     ext_added = false
     new_insts = SPVInst[]
 
@@ -208,19 +216,29 @@ function fix_capabilities!(mod::SPVModule)
         # Remove Linkage capability
         op == OP_CAPABILITY && inst.words[2] == CAP_LINKAGE && continue
 
-        # After Shader capability, insert PhysicalStorageBufferAddresses
-        if op == OP_CAPABILITY && inst.words[2] == CAP_SHADER && !has_psb && !psb_cap_added
+        # After Shader capability, insert required capabilities
+        if op == OP_CAPABILITY && inst.words[2] == CAP_SHADER && !caps_added
             push!(new_insts, inst)
-            push!(new_insts, SPVInst(OP_CAPABILITY, CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES))
-            psb_cap_added = true
+            if !has_psb
+                push!(new_insts, SPVInst(OP_CAPABILITY, CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES))
+            end
+            # VariablePointers enables OpSelect/OpPhi on pointer types (needed for
+            # closures, conditional array accesses, loop-dependent pointers, etc.)
+            push!(new_insts, SPVInst(OP_CAPABILITY, CAP_VARIABLE_POINTERS_STORAGE_BUFFER))
+            push!(new_insts, SPVInst(OP_CAPABILITY, CAP_VARIABLE_POINTERS))
+            caps_added = true
             continue
         end
 
-        # Before first non-capability, insert SPV_KHR_physical_storage_buffer extension
+        # Before first non-capability, insert required extensions
         if !ext_added && op != OP_CAPABILITY
-            str = spv_encode_string("SPV_KHR_physical_storage_buffer")
-            wc = 1 + length(str)
-            push!(new_insts, SPVInst(UInt32[(UInt32(wc) << 16) | UInt32(OP_EXTENSION), str...]))
+            for ext_name in ["SPV_KHR_physical_storage_buffer",
+                             "SPV_KHR_variable_pointers",
+                             "SPV_KHR_storage_buffer_storage_class"]
+                str = spv_encode_string(ext_name)
+                wc = 1 + length(str)
+                push!(new_insts, SPVInst(UInt32[(UInt32(wc) << 16) | UInt32(OP_EXTENSION), str...]))
+            end
             ext_added = true
         end
 
@@ -315,18 +333,58 @@ end
 # CrossWorkgroup → PhysicalStorageBuffer, UniformConstant → PushConstant.
 
 function fix_storage_classes!(mod::SPVModule)
-    remap(sc) = sc == SC_CROSS_WORKGROUP    ? SC_PHYSICAL_STORAGE_BUFFER :
-                sc == SC_UNIFORM_CONSTANT   ? SC_PUSH_CONSTANT : sc
-
+    # Simple remapping:
+    # - CrossWorkgroup → PhysicalStorageBuffer (BDA array pointers)
+    # - UniformConstant → PushConstant
+    #
+    # Constant globals (polynomial tables etc.) are moved from addrspace(1) to
+    # addrspace(0) at the LLVM IR level by _move_constant_globals_to_private!,
+    # so they never appear as CrossWorkgroup in the SPIR-V binary.
     for inst in mod.insts
         op = opcode(inst)
         if op == OP_TYPE_POINTER && wordcount(inst) == 4
-            inst.words[3] = remap(inst.words[3])
+            if inst.words[3] == SC_CROSS_WORKGROUP
+                inst.words[3] = SC_PHYSICAL_STORAGE_BUFFER
+            elseif inst.words[3] == SC_UNIFORM_CONSTANT
+                inst.words[3] = SC_PUSH_CONSTANT
+            end
         elseif op == OP_VARIABLE && wordcount(inst) >= 4
-            inst.words[4] = remap(inst.words[4])
+            if inst.words[4] == SC_CROSS_WORKGROUP
+                inst.words[4] = SC_PHYSICAL_STORAGE_BUFFER
+            elseif inst.words[4] == SC_UNIFORM_CONSTANT
+                inst.words[4] = SC_PUSH_CONSTANT
+            end
         end
     end
 end
+
+# ── 7b. Strip disallowed OpVariable initializers ─────────────────────────
+# In Vulkan SPIR-V, OpVariable with an Initializer operand is only allowed in
+# Output(3), Private(6), Function(7), and Workgroup(4) with ZeroInitialize.
+# The LLVM SPIR-V backend sometimes emits initializers for PhysicalStorageBuffer
+# or PushConstant variables (from Julia constants captured in closures).
+# Strip the initializer word to make these valid.
+
+function fix_variable_initializers!(mod::SPVModule)
+    # Storage classes that allow initializers
+    allowed_init_sc = Set{UInt32}([
+        UInt32(3),   # Output
+        UInt32(6),   # Private
+        UInt32(7),   # Function
+    ])
+
+    for inst in mod.insts
+        if opcode(inst) == OP_VARIABLE && wordcount(inst) == 5
+            sc = inst.words[4]
+            if sc ∉ allowed_init_sc
+                # Strip the initializer (5th word) by truncating + fixing word count
+                pop!(inst.words)
+                inst.words[1] = (UInt32(4) << 16) | UInt32(OP_VARIABLE)
+            end
+        end
+    end
+end
+
 
 # ── 8. Fix merge placement ───────────────────────────────────────────────
 # The LLVM SPIR-V backend at -O0 may emit instructions between
@@ -570,6 +628,72 @@ function fix_pushconstant_bitcast!(mod::SPVModule)
 end
 
 
+# ── OpOrdered/OpUnordered → OpIsNan lowering ─────────────────────────────
+#
+# SPIR-V Shader model does not support OpOrdered/OpUnordered (requires Kernel
+# capability). Julia generates these from `fcmp ord`/`fcmp uno` for isnan checks.
+#
+# Following clspv's approach (SPIRVProducerPass.cpp:6073-6119), we lower:
+#   OpOrdered   %bool %x %y  →  NOT (IsNan(%x) OR IsNan(%y))
+#   OpUnordered %bool %x %y  →  IsNan(%x) OR IsNan(%y)
+#
+# OpIsNan is available in Shader model (no extra capability needed).
+
+function fix_ordered_unordered!(mod::SPVModule)
+    # Find all OpOrdered/OpUnordered instructions
+    indices = Int[]
+    for (i, inst) in enumerate(mod.insts)
+        op = opcode(inst)
+        if op == OP_ORDERED || op == OP_UNORDERED
+            push!(indices, i)
+        end
+    end
+    isempty(indices) && return
+
+    # Process in reverse order so insertion indices stay valid
+    for idx in reverse(indices)
+        inst = mod.insts[idx]
+        op = opcode(inst)
+        # OpOrdered/OpUnordered format: [header, result_type, result_id, operand1, operand2]
+        result_type = inst.words[2]  # %bool
+        result_id   = inst.words[3]
+        op_x        = inst.words[4]
+        op_y        = inst.words[5]
+
+        new_insts = SPVInst[]
+
+        # OpIsNan %bool %x
+        isnan_x_id = alloc_id!(mod)
+        push!(new_insts, SPVInst(OP_IS_NAN, result_type, isnan_x_id, op_x))
+
+        # OpIsNan %bool %y
+        isnan_y_id = alloc_id!(mod)
+        push!(new_insts, SPVInst(OP_IS_NAN, result_type, isnan_y_id, op_y))
+
+        # OpLogicalOr %bool isnan_x isnan_y  (= "either is NaN" = unordered)
+        or_id = alloc_id!(mod)
+        push!(new_insts, SPVInst(OP_LOGICAL_OR, result_type, or_id, isnan_x_id, isnan_y_id))
+
+        if op == OP_ORDERED
+            # OpOrdered = NOT unordered
+            not_id = alloc_id!(mod)
+            push!(new_insts, SPVInst(OP_LOGICAL_NOT, result_type, not_id, or_id))
+            # Rewrite: original result_id now comes from the NOT
+            # We replace the instruction and patch references
+            # Simpler: give the NOT the original result_id
+            new_insts[end] = SPVInst(OP_LOGICAL_NOT, result_type, result_id, or_id)
+        else
+            # OpUnordered: result is the OR directly
+            # Give the OR the original result_id
+            new_insts[end] = SPVInst(OP_LOGICAL_OR, result_type, result_id, isnan_x_id, isnan_y_id)
+        end
+
+        # Replace the original instruction with the new sequence
+        splice!(mod.insts, idx, new_insts)
+    end
+end
+
+
 # ── spirv-opt wrapper ────────────────────────────────────────────────────
 
 function _spirv_opt(spv_bytes::Vector{UInt8})
@@ -618,8 +742,10 @@ function spirv_fixup(spv_bytes::Vector{UInt8}, push_struct_info::Vector{Pair{Int
     fix_execution_modes!(mod, entry_id)
     fix_decorations!(mod, push_struct_type_id, push_struct_info)
     fix_storage_classes!(mod)
+    fix_variable_initializers!(mod)
     fix_merge_placement!(mod)
     fix_barrier_semantics!(mod)
+    fix_ordered_unordered!(mod)
     fix_duplicate_merge_targets!(mod)
 
     # Dead function elimination via spirv-opt

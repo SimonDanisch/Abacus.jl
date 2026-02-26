@@ -112,3 +112,35 @@ end
         end
     end
 end
+
+# leading_zeros — software implementation for GPU (SPIR-V has no ctlz)
+# Uses binary search approach: O(log2(bitwidth)) steps, no loops.
+@shared_device_override @inline function Base.leading_zeros(x::UInt32)
+    n = Int32(0)
+    # Binary search: check upper half, shift down if empty
+    if (x & 0xFFFF0000) == 0; n += Int32(16); x <<= 16; end
+    if (x & 0xFF000000) == 0; n += Int32(8);  x <<= 8;  end
+    if (x & 0xF0000000) == 0; n += Int32(4);  x <<= 4;  end
+    if (x & 0xC0000000) == 0; n += Int32(2);  x <<= 2;  end
+    if (x & 0x80000000) == 0; n += Int32(1);             end
+    return n
+end
+
+@shared_device_override @inline function Base.leading_zeros(x::UInt64)
+    n = Int32(0)
+    if (x & 0xFFFFFFFF00000000) == 0; n += Int32(32); x <<= 32; end
+    if (x & 0xFFFF000000000000) == 0; n += Int32(16); x <<= 16; end
+    if (x & 0xFF00000000000000) == 0; n += Int32(8);  x <<= 8;  end
+    if (x & 0xF000000000000000) == 0; n += Int32(4);  x <<= 4;  end
+    if (x & 0xC000000000000000) == 0; n += Int32(2);  x <<= 2;  end
+    if (x & 0x8000000000000000) == 0; n += Int32(1);             end
+    return n
+end
+
+@shared_device_override @inline function Base.leading_zeros(x::Int32)
+    Base.leading_zeros(reinterpret(UInt32, x))
+end
+
+@shared_device_override @inline function Base.leading_zeros(x::Int64)
+    Base.leading_zeros(reinterpret(UInt64, x))
+end

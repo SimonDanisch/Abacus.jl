@@ -96,8 +96,9 @@ workgroup using shared memory, and writes one result per workgroup to `R`.
 function _vk_reduce_kernel(f::F, op::OP,
                            A_addr::UInt64, R_addr::UInt64,
                            n::UInt32, neutral::T,
-                           ::Val{WGS}, ::Val{MAX_ITERS}) where {F, OP, T, WGS, MAX_ITERS}
-    A = VkPtr{T}(A_addr)
+                           ::Val{WGS}, ::Val{MAX_ITERS},
+                           ::Val{S}) where {F, OP, T, WGS, MAX_ITERS, S}
+    A = VkPtr{S}(A_addr)
     R = VkPtr{T}(R_addr)
 
     lid = vk_local_invocation_id_x()
@@ -169,9 +170,9 @@ function _gpu_full_reduce!(f, op, R::VkArray{T}, A::VkArray, init) where T
 end
 
 """Compile (cached) and dispatch the reduction kernel."""
-function _dispatch_reduce!(f, op, A::VkArray{T}, R::VkArray{T},
+function _dispatch_reduce!(f, op, A::VkArray{S}, R::VkArray{T},
                            n::UInt32, neutral::T,
-                           wgs::Int, ngroups::Int) where T
+                           wgs::Int, ngroups::Int) where {S, T}
     # Compute max iterations for grid-stride loop (compile-time constant)
     total_threads = wgs * ngroups
     max_iters = cld(Int(n), total_threads)
@@ -179,17 +180,17 @@ function _dispatch_reduce!(f, op, A::VkArray{T}, R::VkArray{T},
     # Build argument tuple matching _vk_reduce_kernel signature
     kernel_args = (f, op,
                    device_address(A), device_address(R),
-                   n, neutral, Val(wgs), Val(max_iters))
+                   n, neutral, Val(wgs), Val(max_iters), Val(S))
     adapted_args = map(kernel_convert, kernel_args)
     adapted_tt = Tuple{map(Core.Typeof, adapted_args)...}
 
     kernel = vkfunction(_vk_reduce_kernel, adapted_tt;
                         workgroup_size=(wgs, 1, 1))
-    push_data = _pack_push_constants(adapted_args, kernel.push_size)
+    bda_data, arg_buf = _pack_and_upload_args(adapted_args, kernel.arg_buffer_size)
 
     groups = (ngroups, 1, 1)
     GC.@preserve A R begin
-        vk_dispatch!(kernel.pipeline, push_data, groups)
+        vk_dispatch!(kernel.pipeline, bda_data, groups)
     end
 end
 
@@ -201,20 +202,13 @@ function GPUArrays.mapreducedim!(f, op, R::VkArray{T},
     Base.check_reducedims(R, A)
     length(A) == 0 && return R
 
-    # GPU fast path: full reduction of VkArray input (R is scalar-sized)
+    # GPU path: full reduction of VkArray input (R is scalar-sized)
     if A isa VkArray && prod(size(R)) == 1
         return _gpu_full_reduce!(f, op, R, A, init)
     end
 
-    # CPU fallback for partial reductions and Broadcasted inputs.
-    # Uses bulk memcpy (not scalar indexing) — acceptable until we implement
-    # a general GPU partial-reduction kernel with CartesianIndex support.
-    hostA = A isa VkArray ? Array(A) : GPUArrays.@allowscalar map(identity, A)
-    hostR = Array(R)
-    if init !== nothing
-        fill!(hostR, init)
-    end
-    Base.mapreducedim!(f, op, hostR, hostA)
-    copyto!(R, hostR)
-    return R
+    # Partial reductions and Broadcasted inputs — not yet implemented on GPU.
+    # TODO: implement a general GPU partial-reduction kernel with CartesianIndex support.
+    error("Partial reductions and Broadcasted inputs not yet supported on VulkanBackend. " *
+          "Only full reductions (scalar output) of VkArray inputs are supported.")
 end

@@ -159,18 +159,6 @@ end
 
 # ── Shared memory ─────────────────────────────────────────────────────
 
-"""Map Julia type to LLVM IR type string."""
-function _llvm_type_str(::Type{T}) where T
-    T === Float32 && return "float"
-    T === Float64 && return "double"
-    T === Float16 && return "half"
-    (T === Int32 || T === UInt32) && return "i32"
-    (T === Int64 || T === UInt64) && return "i64"
-    (T === Int16 || T === UInt16) && return "i16"
-    (T === Int8 || T === UInt8) && return "i8"
-    error("Unsupported type $T for Vulkan shared memory")
-end
-
 struct VkLocalArray{T}
     ptr::Core.LLVMPtr{T, 3}
 end
@@ -184,16 +172,48 @@ Base.@propagate_inbounds function Base.setindex!(a::VkLocalArray{T}, v, i::Integ
     return a
 end
 
+# Map Julia primitive type to LLVM IR type string (for shared memory globals).
+function _llvm_type_str(::Type{T}) where T
+    T === Float16 && return "half"
+    T === Float32 && return "float"
+    T === Float64 && return "double"
+    isprimitivetype(T) && return "i$(8*sizeof(T))"
+    error("_llvm_type_str: unsupported type $T (use _flat_shared_type for composites)")
+end
+
+# Compute a flat LLVM array type for shared memory.
+# Primitives use typed arrays (e.g., [256 x float]).
+# Composites are flattened to [N x i32] following clspv's approach:
+# LLVM's SRoA decomposes struct loads/stores into individual field accesses,
+# generating GEP types that don't match the original struct type declaration.
+# The SPIR-V backend crashes on this mismatch. Flat i32 arrays avoid it.
+function _flat_shared_type(::Type{T}, len::Int) where T
+    if isprimitivetype(T) || T === Bool
+        llvm_t = _llvm_type_str(T)
+        return (llvm_t, len)
+    end
+    # Composite: flatten to i32 array
+    @assert sizeof(T) % 4 == 0 "Shared memory type $T must be 4-byte aligned (sizeof=$(sizeof(T)))"
+    n_i32 = len * (sizeof(T) ÷ 4)
+    return ("i32", n_i32)
+end
+
+# Allocate workgroup shared memory for any isbits type T.
+# Primitives use typed arrays (e.g., [256 x float]).
+# Composites are flattened to i32 arrays following clspv's approach —
+# the SPIR-V backend can't handle struct array globals when LLVM's SRoA
+# decomposes accesses into different GEP types.
 @generated function vk_localmemory(::Val{Id}, ::Type{T}, ::Val{len}) where {Id, T, len}
-    llvm_t = _llvm_type_str(T)
+    isbitstype(T) || error("vk_localmemory requires isbits type, got $T")
+    elem_type, total_len = _flat_shared_type(T, len)
     align = max(sizeof(T), 4)
     safe_id = replace(string(Id), r"[^a-zA-Z0-9_]" => "_")
     gv_name = "__vk_shared_$(safe_id)"
 
     ir = """
-        @$gv_name = internal addrspace(3) global [$len x $llvm_t] undef, align $align
+        @$gv_name = internal addrspace(3) global [$total_len x $elem_type] undef, align $align
         define ptr addrspace(3) @entry() #0 {
-            %ptr = getelementptr [$len x $llvm_t], ptr addrspace(3) @$gv_name, i32 0, i32 0
+            %ptr = getelementptr [$total_len x $elem_type], ptr addrspace(3) @$gv_name, i32 0, i32 0
             ret ptr addrspace(3) %ptr
         }
         attributes #0 = { alwaysinline }
@@ -202,14 +222,15 @@ end
 end
 
 @generated function vk_localmemory(::Type{T}, ::Val{len}) where {T, len}
-    llvm_t = _llvm_type_str(T)
+    isbitstype(T) || error("vk_localmemory requires isbits type, got $T")
+    elem_type, total_len = _flat_shared_type(T, len)
     align = max(sizeof(T), 4)
-    gv_name = "__vk_shared_$(len)x$(sizeof(T))b"
+    gv_name = "__vk_shared_$(total_len)x_$(elem_type)"
 
     ir = """
-        @$gv_name = internal addrspace(3) global [$len x $llvm_t] undef, align $align
+        @$gv_name = internal addrspace(3) global [$total_len x $elem_type] undef, align $align
         define ptr addrspace(3) @entry() #0 {
-            %ptr = getelementptr [$len x $llvm_t], ptr addrspace(3) @$gv_name, i32 0, i32 0
+            %ptr = getelementptr [$total_len x $elem_type], ptr addrspace(3) @$gv_name, i32 0, i32 0
             ret ptr addrspace(3) %ptr
         }
         attributes #0 = { alwaysinline }
@@ -252,37 +273,33 @@ end
 
 # ── Unary math via OpenCL mangled llvmcall ──
 # (Julia function, OpenCL name, types to override)
+#
+# NOTE: GLSL.std.450 transcendentals (sin, cos, exp, log, pow, etc.) only support
+# 16-bit and 32-bit floats. Float64 transcendentals need pure-Julia implementations
+# (see device/math.jl). Only non-transcendental ops (sqrt, abs, floor, ceil, trunc,
+# round, sign) work for Float64 via GLSL.std.450.
 const _VK_UNARY_MATH = [
-    # Trig — NOT in device/math.jl → Float32, Float16, Float64
-    (:(Base.tan),            "tan",     [Float32, Float16, Float64]),
-    (:(Base.asin),           "asin",    [Float32, Float16, Float64]),
-    (:(Base.acos),           "acos",    [Float32, Float16, Float64]),
-    (:(Base.atan),           "atan",    [Float32, Float16, Float64]),
-    # Hyperbolic — NOT in device/math.jl → all types
-    (:(Base.sinh),           "sinh",    [Float32, Float16, Float64]),
-    (:(Base.cosh),           "cosh",    [Float32, Float16, Float64]),
-    (:(Base.tanh),           "tanh",    [Float32, Float16, Float64]),
-    (:(Base.asinh),          "asinh",   [Float32, Float16, Float64]),
-    (:(Base.acosh),          "acosh",   [Float32, Float16, Float64]),
-    (:(Base.atanh),          "atanh",   [Float32, Float16, Float64]),
-    # Misc — NOT in device/math.jl → all types
+    # Trig — Float32/Float16 only (GLSL.std.450 limitation)
+    (:(Base.tan),            "tan",     [Float32, Float16]),
+    (:(Base.asin),           "asin",    [Float32, Float16]),
+    (:(Base.acos),           "acos",    [Float32, Float16]),
+    (:(Base.atan),           "atan",    [Float32, Float16]),
+    # Hyperbolic — Float32/Float16 only
+    (:(Base.sinh),           "sinh",    [Float32, Float16]),
+    (:(Base.cosh),           "cosh",    [Float32, Float16]),
+    (:(Base.tanh),           "tanh",    [Float32, Float16]),
+    (:(Base.asinh),          "asinh",   [Float32, Float16]),
+    (:(Base.acosh),          "acosh",   [Float32, Float16]),
+    (:(Base.atanh),          "atanh",   [Float32, Float16]),
+    # Misc — sign works for all types (GLSL.std.450 FSign supports Float64)
     (:(Base.sign),           "sign",    [Float32, Float16, Float64]),
-    # Functions IN device/math.jl → Float64 only (Float32/Float16 already handled)
-    (:(Base.sin),            "sin",     [Float64]),
-    (:(Base.cos),            "cos",     [Float64]),
-    (:(Base.exp),            "exp",     [Float64]),
-    (:(Base.exp2),           "exp2",    [Float64]),
-    (:(Base.log),            "log",     [Float64]),
-    (:(Base.log2),           "log2",    [Float64]),
-    (:(Base.log10),          "log10",   [Float64]),
+    # Non-transcendental ops — work for Float64 via GLSL.std.450
     (:(Base.sqrt),           "sqrt",    [Float64]),
     (:(Base.abs),            "fabs",    [Float64]),
     (:(Base.floor),          "floor",   [Float64]),
     (:(Base.ceil),           "ceil",    [Float64]),
     (:(Base.trunc),          "trunc",   [Float64]),
     (:(Base.round),          "round",   [Float64]),
-    (:(Base.Math.expm1),     "expm1",   [Float64]),
-    (:(Base.Math.log1p),     "log1p",   [Float64]),
 ]
 
 for (jlfun, ocl_name, types) in _VK_UNARY_MATH
@@ -319,12 +336,14 @@ for (jlfun, ocl_name) in [(:(Base.min), "fmin"), (:(Base.max), "fmax")]
 end
 
 # ── Binary math via OpenCL mangled llvmcall ──
+# NOTE: GLSL.std.450 binary math (atan2, pow, etc.) only supports 16/32-bit floats.
+# Float64 versions are pure-Julia in device/math.jl (copysign, hypot already there).
 const _VK_BINARY_MATH = [
     # (Julia function, OpenCL name, types)
-    (:(Base.atan),      "atan2",    [Float32, Float16, Float64]),  # 2-arg atan
-    (:(Base.copysign),  "copysign", [Float64]),                    # F32/F16 in device/math.jl
-    (:(Base.hypot),     "hypot",    [Float64]),                    # F32/F16 in device/math.jl
-    (:(Base.:(^)),      "pow",      [Float64]),                    # F32/F16 in device/math.jl
+    (:(Base.atan),      "atan2",    [Float32, Float16]),  # 2-arg atan, Float64 needs pure-Julia
+    # copysign: F32/F16 in device/math.jl (llvm intrinsic), F64 via pure-Julia @vk_device_override
+    # hypot:    F32/F16/F64 all in device/math.jl (pure-Julia)
+    # pow:      F32/F16 via llvm.pow, F64 via exp(y*log(x)) in device/math.jl
 ]
 
 for (jlfun, ocl_name, types) in _VK_BINARY_MATH
@@ -339,11 +358,6 @@ for (jlfun, ocl_name, types) in _VK_BINARY_MATH
     end
 end
 
-# ── Ternary: fma for Float64 ──
-# Float32/Float16 fma already in device/math.jl via llvm.fma
-let mangled = "_Z3fmaddd", lt = "double"
-    _register_intrinsic!(mangled)
-    @eval @vk_device_override @inline Base.fma(a::Float64, b::Float64, c::Float64) = Base.llvmcall(
-        ($("declare $lt @$mangled($lt, $lt, $lt)\ndefine $lt @entry($lt %0, $lt %1, $lt %2) {\n  %r = call $lt @$mangled($lt %0, $lt %1, $lt %2)\n  ret $lt %r\n}"), "entry"),
-        Float64, Tuple{Float64, Float64, Float64}, a, b, c)
-end
+# ── Ternary: fma ──
+# All types (Float32/Float16/Float64) now handled in device/math.jl via llvm.fma intrinsic.
+# llvm.fma maps to GLSL.std.450 Fma which supports all float types including Float64.

@@ -8,6 +8,17 @@
 # Allocated once to avoid per-dispatch Vector/struct allocations.
 const _submit_info = Ref{Any}(nothing)
 
+# In-flight argument buffers that must stay alive until vk_flush!() completes.
+# BDA argument buffers are referenced by the GPU via PhysicalStorageBuffer;
+# if GC frees them before the GPU finishes, we get GPUVM faults.
+const _inflight_arg_bufs = VkManagedBuffer[]
+
+"""Keep an argument buffer alive until the next vk_flush!() completes."""
+function _keep_alive!(buf::VkManagedBuffer)
+    push!(_inflight_arg_bufs, buf)
+    return
+end
+
 function _get_submit_info(ctx::VkContext)
     si = _submit_info[]
     if si !== nothing
@@ -47,15 +58,15 @@ function vk_dispatch!(pipeline::VkComputePipeline, push_data::Vector{UInt8},
     # Barrier between consecutive dispatches (not before the first one)
     if ctx.dispatch_count > 0
         barrier = Vulkan.MemoryBarrier(
+            C_NULL,
             Vulkan.ACCESS_SHADER_WRITE_BIT,
             Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT)
         Vulkan.cmd_pipeline_barrier(cmd,
-            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            Vulkan.DependencyFlag(0),
             [barrier],
             Vulkan.BufferMemoryBarrier[],
-            Vulkan.ImageMemoryBarrier[])
+            Vulkan.ImageMemoryBarrier[];
+            src_stage_mask = Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            dst_stage_mask = Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     end
 
     Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
@@ -98,6 +109,9 @@ function vk_flush!()
 
     ctx.recording = false
     ctx.dispatch_count = 0
+
+    # Release in-flight argument buffers (GPU is done with them now)
+    empty!(_inflight_arg_bufs)
 
     return nothing
 end
