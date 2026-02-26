@@ -56,6 +56,7 @@ include("vulkan/compilation.jl")
 include("vulkan/commands.jl")
 include("vulkan/execution.jl")
 include("vulkan/mapreduce.jl")
+include("vulkan/atomics.jl")
 
 export VkContext, VkArray, VkVector, VkMatrix, VkDeviceArray, VkPtr, @vulkan, vk_flush!
 

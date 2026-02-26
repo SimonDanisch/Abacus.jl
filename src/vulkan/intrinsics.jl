@@ -178,42 +178,87 @@ function _llvm_type_str(::Type{T}) where T
     T === Float32 && return "float"
     T === Float64 && return "double"
     isprimitivetype(T) && return "i$(8*sizeof(T))"
-    error("_llvm_type_str: unsupported type $T (use _flat_shared_type for composites)")
+    error("_llvm_type_str: unsupported type $T")
 end
 
-# Compute a flat LLVM array type for shared memory.
-# Primitives use typed arrays (e.g., [256 x float]).
-# Composites are flattened to [N x i32] following clspv's approach:
-# LLVM's SRoA decomposes struct loads/stores into individual field accesses,
-# generating GEP types that don't match the original struct type declaration.
-# The SPIR-V backend crashes on this mismatch. Flat i32 arrays avoid it.
-function _flat_shared_type(::Type{T}, len::Int) where T
-    if isprimitivetype(T) || T === Bool
-        llvm_t = _llvm_type_str(T)
-        return (llvm_t, len)
+# Compute the LLVM scalar type and flat array length for a shared memory global.
+#
+# The LLVM SPIR-V backend (llc) crashes on nested array/struct types in
+# workgroup storage (addrspace 3). The crash occurs in 'SPIRV legalize
+# bitcast pass' when load/store types don't match the GEP result type
+# (e.g., `store float` to a `[2 x float]*`).
+#
+# Strategy: ALWAYS use flat scalar arrays.
+#  - Primitives: [len x T_llvm]  (e.g., [256 x float])
+#  - Homogeneous composites: flatten to [len * nfields x scalar_llvm]
+#    e.g., Vec2f{Float32,Float32} with len=256 → [512 x float]
+#  - Heterogeneous: flatten to [len * sizeof(T)/4 x i32]
+#
+# The _fix_shared_geps! pass in compilation.jl rewrites SRoA-decomposed GEPs
+# (which use [nfields x scalar] as source type) into flat-array GEPs with
+# index arithmetic: flat_idx = elem_idx * nfields + field_idx.
+#
+# Recursively find the leaf primitive type of a composite.
+# Returns the primitive type if all leaves are the same, or `nothing` if mixed.
+function _leaf_scalar_type(::Type{T}) where T
+    isprimitivetype(T) && return T
+    T === Bool && return T
+    nf = fieldcount(T)
+    nf == 0 && return nothing  # opaque type, can't decompose
+    leaf = nothing
+    for i in 1:nf
+        ft = fieldtype(T, i)
+        fl = _leaf_scalar_type(ft)
+        fl === nothing && return nothing  # can't determine leaf
+        if leaf === nothing
+            leaf = fl
+        elseif leaf !== fl
+            return nothing  # mixed leaf types
+        end
     end
-    # Composite: flatten to i32 array
-    @assert sizeof(T) % 4 == 0 "Shared memory type $T must be 4-byte aligned (sizeof=$(sizeof(T)))"
-    n_i32 = len * (sizeof(T) ÷ 4)
-    return ("i32", n_i32)
+    return leaf
+end
+
+# Returns (scalar_llvm_type::String, flat_length::Int)
+function _shared_flat_info(::Type{T}, len::Int) where T
+    if isprimitivetype(T) || T === Bool
+        return (_llvm_type_str(T), len)
+    end
+    nf = fieldcount(T)
+    if nf == 0
+        return ("i$(8*sizeof(T))", len)
+    end
+    # Find the leaf scalar type by recursively descending into composite fields.
+    # LLVM SRoA fully decomposes nested structs into scalar loads/stores,
+    # so we need to match the leaf primitive type.
+    leaf = _leaf_scalar_type(T)
+    if leaf !== nothing
+        # All leaf fields are the same primitive type → flat scalar array
+        n_scalars = sizeof(T) ÷ sizeof(leaf)
+        @assert n_scalars * sizeof(leaf) == sizeof(T) "Size mismatch for $T"
+        return (_llvm_type_str(leaf), len * n_scalars)
+    else
+        # Heterogeneous leaves: use i32 (4 bytes) as universal flat element
+        n_i32 = sizeof(T) ÷ 4
+        @assert n_i32 * 4 == sizeof(T) "Shared memory type $T size not a multiple of 4"
+        return ("i32", len * n_i32)
+    end
 end
 
 # Allocate workgroup shared memory for any isbits type T.
-# Primitives use typed arrays (e.g., [256 x float]).
-# Composites are flattened to i32 arrays following clspv's approach —
-# the SPIR-V backend can't handle struct array globals when LLVM's SRoA
-# decomposes accesses into different GEP types.
+# Uses typed LLVM arrays that match what LLVM SRoA will decompose struct
+# accesses into, so the SPIR-V backend sees consistent types.
 @generated function vk_localmemory(::Val{Id}, ::Type{T}, ::Val{len}) where {Id, T, len}
     isbitstype(T) || error("vk_localmemory requires isbits type, got $T")
-    elem_type, total_len = _flat_shared_type(T, len)
-    align = max(sizeof(T), 4)
+    scalar, flat_len = _shared_flat_info(T, len)
+    align = nextpow(2, max(sizeof(T), 4))
     safe_id = replace(string(Id), r"[^a-zA-Z0-9_]" => "_")
     gv_name = "__vk_shared_$(safe_id)"
 
     ir = """
-        @$gv_name = internal addrspace(3) global [$total_len x $elem_type] undef, align $align
+        @$gv_name = internal addrspace(3) global [$flat_len x $scalar] undef, align $align
         define ptr addrspace(3) @entry() #0 {
-            %ptr = getelementptr [$total_len x $elem_type], ptr addrspace(3) @$gv_name, i32 0, i32 0
+            %ptr = getelementptr [$flat_len x $scalar], ptr addrspace(3) @$gv_name, i32 0, i32 0
             ret ptr addrspace(3) %ptr
         }
         attributes #0 = { alwaysinline }
@@ -223,14 +268,15 @@ end
 
 @generated function vk_localmemory(::Type{T}, ::Val{len}) where {T, len}
     isbitstype(T) || error("vk_localmemory requires isbits type, got $T")
-    elem_type, total_len = _flat_shared_type(T, len)
-    align = max(sizeof(T), 4)
-    gv_name = "__vk_shared_$(total_len)x_$(elem_type)"
+    scalar, flat_len = _shared_flat_info(T, len)
+    align = nextpow(2, max(sizeof(T), 4))
+    safe_scalar = replace(scalar, r"[^a-zA-Z0-9_]" => "_")
+    gv_name = "__vk_shared_$(flat_len)x_$(safe_scalar)"
 
     ir = """
-        @$gv_name = internal addrspace(3) global [$total_len x $elem_type] undef, align $align
+        @$gv_name = internal addrspace(3) global [$flat_len x $scalar] undef, align $align
         define ptr addrspace(3) @entry() #0 {
-            %ptr = getelementptr [$total_len x $elem_type], ptr addrspace(3) @$gv_name, i32 0, i32 0
+            %ptr = getelementptr [$flat_len x $scalar], ptr addrspace(3) @$gv_name, i32 0, i32 0
             ret ptr addrspace(3) %ptr
         }
         attributes #0 = { alwaysinline }

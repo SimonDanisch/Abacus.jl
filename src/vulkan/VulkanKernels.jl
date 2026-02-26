@@ -21,7 +21,7 @@ KA.get_backend(::VkArray) = VulkanBackend()
 KA.synchronize(::VulkanBackend) = vk_flush!()
 
 KA.supports_float64(::VulkanBackend) = true
-KA.supports_atomics(::VulkanBackend) = false
+KA.supports_atomics(::VulkanBackend) = true
 
 Adapt.adapt_storage(::VulkanBackend, a::Array) = Adapt.adapt(VkArray, a)
 Adapt.adapt_storage(::VulkanBackend, a::VkArray) = a

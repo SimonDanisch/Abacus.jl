@@ -1934,33 +1934,137 @@ function _fix_shared_geps!(mod::LLVM.Module)
                 end
             end
 
-            # Part 1: Fix flat instruction GEPs
-            to_fix = Tuple{LLVM.GetElementPtrInst, LLVM.LLVMType}[]
-            for inst in LLVM.instructions(bb)
-                inst isa LLVM.GetElementPtrInst || continue
-                ops = LLVM.operands(inst)
-                length(ops) == 2 || continue  # flat GEP: pointer + one index
-                ptr_op = ops[1]
-                haskey(shared_globals, ptr_op) || continue
-                # Verify the GEP uses element type (flat), not array type (structured)
-                src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
-                arr_ty = shared_globals[ptr_op]
-                elem_ty = eltype(arr_ty)
-                src_ty == elem_ty || continue
-                push!(to_fix, (inst, arr_ty))
+            # Part 1: Flatten all GEPs on shared memory globals to use the flat
+            # scalar array type with a single computed index.
+            #
+            # SRoA decomposes nested struct accesses into GEPs with nested array
+            # source types (e.g., [2 x [1 x [3 x float]]] for Bounds3{Point3f}).
+            # These come in chains:
+            #   %a = GEP [2 x [1 x [3 x float]]], @global, %i0        → base
+            #   %b = GEP [3 x float], %a, 0, %i1                       → chain
+            #   %c = GEP [3 x float], %b, 0, %i2                       → chain
+            #
+            # Our global is a flat [N x scalar]. We need to collapse all chains
+            # into a single flat GEP: GEP [N x scalar], @global, 0, flat_idx.
+            #
+            # Strategy: iteratively fix GEPs. In each round, fix GEPs that point
+            # directly to the global. Chained GEPs lose their base (it gets erased
+            # and replaced with a flat GEP), so they become "orphaned" — their
+            # pointer operand is now a flat GEP result. In the next round, we merge
+            # them into the flat base by adding their offset to the base's index.
+
+            # Helper: compute total leaf scalar elements in a (nested) array type.
+            function _flat_count(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
+                ty == leaf_ty && return 1
+                ty isa LLVM.ArrayType || return nothing
+                inner = _flat_count(eltype(ty), leaf_ty)
+                inner === nothing && return nothing
+                return length(ty) * inner
             end
 
-            LLVM.IRBuilder() do builder
-                for (gep, arr_ty) in to_fix
-                    ops = LLVM.operands(gep)
+            # Helper: compute flat index from nested indices on a (nested) array type.
+            # In a GEP, the FIRST index steps by the full source type size.
+            # Subsequent indices descend into the type hierarchy.
+            # E.g., GEP [2 x [1 x [3 x float]]], ptr, %i0, %i1, %i2
+            #   %i0 steps by sizeof([2 x [1 x [3 x float]]]) = 6 floats
+            #   %i1 steps by sizeof([1 x [3 x float]]) = 3 floats
+            #   %i2 steps by sizeof(float) = 1 float
+            function _compute_flat_index!(builder, src_ty, elem_ty, indices, T_i64)
+                flat_idx = nothing
+                cur_ty = src_ty
+                for (k, idx) in enumerate(indices)
+                    # First index: stride = full size of source type
+                    # Later indices: stride = size of current level's element
+                    if k == 1
+                        stride_count = _flat_count(cur_ty, elem_ty)
+                        stride = stride_count === nothing ? 1 : stride_count
+                    else
+                        stride_count = _flat_count(cur_ty, elem_ty)
+                        stride = stride_count === nothing ? 1 : stride_count
+                    end
+
+                    idx_val = idx
+                    if LLVM.value_type(idx_val) != T_i64
+                        idx_val = LLVM.sext!(builder, idx_val, T_i64, "shmem_idx64")
+                    end
+
+                    term = stride == 1 ? idx_val :
+                        LLVM.mul!(builder, idx_val,
+                                 LLVM.ConstantInt(T_i64, stride), "shmem_stride")
+
+                    flat_idx = flat_idx === nothing ? term :
+                        LLVM.add!(builder, flat_idx, term, "shmem_flat")
+
+                    # Descend into element type for next index
+                    cur_ty = cur_ty isa LLVM.ArrayType ? eltype(cur_ty) : elem_ty
+                end
+                return flat_idx
+            end
+
+            # Run iteratively: fix direct-to-global GEPs, then fix GEPs chained
+            # on already-fixed GEPs, until no more changes.
+            fixed_geps = Dict{LLVM.Value, LLVM.Value}()  # old_gep → flat_idx value
+            part1_changed = true
+            while part1_changed
+                part1_changed = false
+
+                # Collect GEPs to fix in this round
+                to_fix = Tuple{LLVM.GetElementPtrInst, LLVM.Value, LLVM.LLVMType}[]
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.GetElementPtrInst || continue
+                    ops = LLVM.operands(inst)
+                    length(ops) >= 2 || continue
                     ptr_op = ops[1]
-                    idx = ops[2]
-                    LLVM.position!(builder, gep)
-                    zero = LLVM.ConstantInt(LLVM.value_type(idx), 0)
-                    new_gep = LLVM.gep!(builder, arr_ty, ptr_op,
-                                        LLVM.Value[zero, idx], LLVM.name(gep) * ".fix")
-                    LLVM.replace_uses!(gep, new_gep)
-                    LLVM.erase!(gep)
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+
+                    if haskey(shared_globals, ptr_op)
+                        arr_ty = shared_globals[ptr_op]
+                        src_ty == arr_ty && continue  # already correct
+                        push!(to_fix, (inst, ptr_op, arr_ty))
+                    elseif haskey(fixed_geps, ptr_op)
+                        # Chained GEP on a fixed GEP result — need to merge
+                        # Find the original global this chain leads to
+                        base_gep = ptr_op::LLVM.GetElementPtrInst
+                        base_ptr = LLVM.operands(base_gep)[1]
+                        haskey(shared_globals, base_ptr) || continue
+                        arr_ty = shared_globals[base_ptr]
+                        push!(to_fix, (inst, base_ptr, arr_ty))
+                    end
+                end
+
+                isempty(to_fix) && break
+
+                LLVM.IRBuilder() do builder
+                    for (gep, global_ptr, arr_ty) in to_fix
+                        ops = LLVM.operands(gep)
+                        ptr_op = ops[1]
+                        LLVM.position!(builder, gep)
+                        src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+                        elem_ty = eltype(arr_ty)
+
+                        # Check if source type can be flattened
+                        total = _flat_count(src_ty, elem_ty)
+                        total === nothing && continue
+
+                        indices = LLVM.Value[ops[i] for i in 2:length(ops)]
+                        flat_idx = _compute_flat_index!(builder, src_ty, elem_ty, indices, T_i64)
+                        flat_idx === nothing && continue
+
+                        # If chained on a fixed GEP, add the base's flat index
+                        if haskey(fixed_geps, ptr_op)
+                            base_idx = fixed_geps[ptr_op]
+                            flat_idx = LLVM.add!(builder, base_idx, flat_idx, "shmem_chain_flat")
+                        end
+
+                        zero = LLVM.ConstantInt(T_i64, 0)
+                        new_gep = LLVM.gep!(builder, arr_ty, global_ptr,
+                                            LLVM.Value[zero, flat_idx],
+                                            LLVM.name(gep) * ".fix")
+                        fixed_geps[new_gep] = flat_idx
+                        LLVM.replace_uses!(gep, new_gep)
+                        LLVM.erase!(gep)
+                        part1_changed = true
+                    end
                 end
             end
 
