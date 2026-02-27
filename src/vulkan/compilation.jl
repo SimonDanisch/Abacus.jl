@@ -231,7 +231,8 @@ function vkcompile(@nospecialize(job::GPUCompiler.CompilerJob))
 
         # Apply Vulkan fixups
         fixed_spv = spirv_fixup(raw_spv, push_info.member_layout;
-                               entry_name = push_info.wrapper_name)
+                               entry_name = push_info.wrapper_name,
+                               workgroup_size = wgs)
 
         return (; spirv_bytes = fixed_spv,
                   entry_name = push_info.wrapper_name,
@@ -1333,7 +1334,12 @@ function _prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String;
         end
     end
 
-    # 2. Remove declarations of lifetime intrinsics (now unused)
+    # 2. Replace llvm.spv.* intrinsics with __spirv_* equivalents for llvm-spirv.
+    # llvm.spv.* intrinsics are specific to the LLVM SPIR-V Backend (llc) and
+    # are not recognized by SPIRV-LLVM-Translator (llvm-spirv).
+    _replace_llvm_spv_intrinsics!(mod)
+
+    # 3. Remove declarations of lifetime intrinsics (now unused)
     for f in collect(LLVM.functions(mod))
         fname = LLVM.name(f)
         if startswith(fname, "llvm.lifetime.") && isempty(LLVM.blocks(f))
@@ -1934,6 +1940,77 @@ function _fix_shared_geps!(mod::LLVM.Module)
                 end
             end
 
+            # Part 0.5: Merge struct-field GEPs into array GEPs on shared memory.
+            #
+            # After Pattern B merges pointer-level GEPs, struct field accesses
+            # remain as separate GEPs:
+            #   %elem = GEP [N x {i8, i64}], @shared, 0, %idx
+            #   %field = GEP {i8, i64}, %elem, 0, field_idx
+            #
+            # SPIR-V cannot translate the second GEP (a pointer-level struct access
+            # without Addresses capability). Merge into a single multi-index GEP:
+            #   %field = GEP [N x {i8, i64}], @shared, 0, %idx, field_idx
+            #
+            # This produces OpAccessChain with chained indices: valid in Vulkan.
+            struct_merge_changed = true
+            while struct_merge_changed
+                struct_merge_changed = false
+                struct_fixes = Tuple{LLVM.GetElementPtrInst, LLVM.GetElementPtrInst}[]
+
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.GetElementPtrInst || continue
+                    ops = LLVM.operands(inst)
+                    length(ops) >= 3 || continue  # need ptr + at least 2 indices
+
+                    ptr_op = ops[1]
+                    ptr_op isa LLVM.GetElementPtrInst || continue
+
+                    # Check if ptr_op is a GEP on a shared global
+                    base_ops = LLVM.operands(ptr_op)
+                    base_ptr = base_ops[1]
+                    haskey(shared_globals, base_ptr) || continue
+
+                    # Source type should match the element type of the shared array
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+                    arr_ty = shared_globals[base_ptr]
+                    elem_ty = eltype(arr_ty)
+                    src_ty == elem_ty || continue
+
+                    # First index must be constant 0 (descending into struct, not
+                    # advancing the pointer)
+                    first_idx = ops[2]
+                    if first_idx isa LLVM.ConstantInt && convert(Int, first_idx) == 0
+                        push!(struct_fixes, (inst, ptr_op))
+                    end
+                end
+
+                if !isempty(struct_fixes)
+                    struct_merge_changed = true
+                    LLVM.IRBuilder() do builder
+                        for (gep, base_gep) in struct_fixes
+                            LLVM.position!(builder, gep)
+
+                            base_ops = LLVM.operands(base_gep)
+                            base_ptr = base_ops[1]
+                            arr_ty = shared_globals[base_ptr]
+
+                            # Merge indices: all from base_gep + field indices from gep
+                            # (skip gep's ptr operand and first '0' index)
+                            gep_ops = LLVM.operands(gep)
+                            new_indices = LLVM.Value[base_ops[i] for i in 2:length(base_ops)]
+                            for i in 3:length(gep_ops)
+                                push!(new_indices, gep_ops[i])
+                            end
+
+                            new_gep = LLVM.gep!(builder, arr_ty, base_ptr, new_indices,
+                                                LLVM.name(gep) == "" ? "shmem_struct.fix" : LLVM.name(gep) * ".struct_fix")
+                            LLVM.replace_uses!(gep, new_gep)
+                            LLVM.erase!(gep)
+                        end
+                    end
+                end
+            end
+
             # Part 1: Flatten all GEPs on shared memory globals to use the flat
             # scalar array type with a single computed index.
             #
@@ -2322,6 +2399,10 @@ function _flatten_bda_array_geps!(mod::LLVM.Module)
     end
 end
 
+# Path to llvm-spirv from SPIRV_LLVM_Translator_jll (LLVM 20).
+# More stable than the LLVM SPIR-V backend (llc) which crashes on complex kernels.
+const _LLVM_SPIRV_PATH = "/home/simon/.julia/artifacts/32d724177684caffd85de6609af82469d8ea67df/bin/llvm-spirv"
+
 function _emit_spirv(mod::LLVM.Module, target::GPUCompiler.SPIRVCompilerTarget)
     mktempdir() do dir
         bc_path = joinpath(dir, "kernel.bc")
@@ -2339,37 +2420,80 @@ function _emit_spirv(mod::LLVM.Module, target::GPUCompiler.SPIRVCompilerTarget)
             end
         end
 
-        # -O0: prevent llc from collapsing StructurizeCFG's Flow blocks.
-        # At -O2 (default), the SPIR-V backend simplifies empty blocks, merging
-        # multiple OpSelectionMerge targets into one block (illegal in Vulkan).
-        # We already run our own LLVM optimization passes, so -O0 is safe here.
-        cmd = `$(SPIRV_LLVM_Backend_jll.llc()) $bc_path -filetype=obj -O0 -o $spv_path`
+        # Use SPIRV-LLVM-Translator (llvm-spirv) instead of the LLVM SPIR-V backend (llc).
+        # llvm-spirv is more mature for compute workloads and doesn't crash on complex IR.
+        cmd = `$(_LLVM_SPIRV_PATH) $bc_path -o $spv_path`
         if !isempty(target.extensions)
             str = join(map(ext -> "+$ext", target.extensions), ",")
-            cmd = `$cmd -spirv-ext=$str`
+            cmd = `$cmd --spirv-ext=$str`
         end
-        # Redirect stderr to suppress LLVM stack dumps on llc crashes.
-        # The crash info is not actionable by users; the Julia-level error is
-        # sufficient for debugging.
-        err_path = joinpath(dir, "llc_stderr.txt")
+        err_path = joinpath(dir, "llvm_spirv_stderr.txt")
         try
             open(err_path, "w") do err_io
                 run(pipeline(cmd; stderr=err_io))
             end
         catch e
-            # Read stderr for diagnostic context
-            llc_stderr = isfile(err_path) ? read(err_path, String) : ""
-            # Save the failing .bc for debugging when env var is set
-            if get(ENV, "ABACUS_SAVE_IR", "") == "1" || occursin("PLEASE submit a bug report", llc_stderr)
+            llvm_spirv_stderr = isfile(err_path) ? read(err_path, String) : ""
+            if get(ENV, "ABACUS_SAVE_IR", "") == "1"
                 debug_bc = "/tmp/abacus_failed_kernel.bc"
                 cp(bc_path, debug_bc; force=true)
                 @debug "Saved failing kernel IR to $debug_bc"
             end
-            error("SPIR-V backend (llc) failed to compile kernel. " *
-                  "Set ABACUS_SAVE_IR=1 to save the failing IR for debugging." *
-                  (occursin("PLEASE submit", llc_stderr) ? " (llc crashed internally)" : ""))
+            error("SPIRV-LLVM-Translator (llvm-spirv) failed to compile kernel. " *
+                  "Set ABACUS_SAVE_IR=1 to save the failing IR for debugging.\n" *
+                  llvm_spirv_stderr)
         end
 
         return read(spv_path)
+    end
+end
+
+# Replace llvm.spv.* intrinsics (LLVM SPIR-V Backend specific) with
+# __spirv_* equivalents (SPIRV-LLVM-Translator compatible).
+function _replace_llvm_spv_intrinsics!(mod::LLVM.Module)
+    to_erase = LLVM.Instruction[]
+    barrier_decl = nothing
+
+    for f in LLVM.functions(mod)
+        fname = LLVM.name(f)
+        if fname == "llvm.spv.group.memory.barrier.with.group.sync"
+            for use in LLVM.uses(f)
+                inst = LLVM.user(use)
+                if inst isa LLVM.CallInst
+                    push!(to_erase, inst)
+                end
+            end
+        end
+    end
+
+    isempty(to_erase) && return
+
+    # Create __spirv_ControlBarrier declaration
+    i32 = LLVM.Int32Type()
+    void_ty = LLVM.VoidType()
+    barrier_ty = LLVM.FunctionType(void_ty, [i32, i32, i32])
+    barrier_decl = LLVM.Function(mod, "__spirv_ControlBarrier", barrier_ty)
+    push!(LLVM.function_attributes(barrier_decl), LLVM.EnumAttribute("convergent"))
+    push!(LLVM.function_attributes(barrier_decl), LLVM.EnumAttribute("nounwind"))
+
+    # Replace each call
+    for inst in to_erase
+        builder = LLVM.IRBuilder()
+        LLVM.position!(builder, inst)
+        # Workgroup scope=2, Workgroup scope=2, AcquireRelease|WorkgroupMemory=264
+        scope_wg = LLVM.ConstantInt(i32, 2)
+        semantics = LLVM.ConstantInt(i32, 264)  # 0x108 = AcquireRelease|WorkgroupMemory
+        LLVM.call!(builder, barrier_ty, barrier_decl, [scope_wg, scope_wg, semantics])
+        LLVM.erase!(inst)
+        LLVM.dispose(builder)
+    end
+
+    # Remove old declaration
+    for f in collect(LLVM.functions(mod))
+        if LLVM.name(f) == "llvm.spv.group.memory.barrier.with.group.sync" && isempty(LLVM.blocks(f))
+            if isempty(LLVM.uses(f))
+                LLVM.erase!(f)
+            end
+        end
     end
 end

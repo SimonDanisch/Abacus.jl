@@ -26,6 +26,9 @@ const _SPIRV_VAL_IGNORED_VUIDS = [
     "VUID-StandaloneSpirv-MemorySemantics-10866",
 ]
 
+# Error substrings to ignore in spirv-val output (for patterns without VUIDs)
+const _SPIRV_VAL_IGNORED_MESSAGES = String[]
+
 function _validate_spirv(spirv_bytes::Vector{UInt8})
     mktempdir() do dir
         spv_path = joinpath(dir, "kernel.spv")
@@ -41,7 +44,8 @@ function _validate_spirv(spirv_bytes::Vector{UInt8})
                 # Filter out known-acceptable errors
                 real_errors = filter(split(err_text, '\n')) do line
                     startswith(line, "error:") &&
-                        !any(vuid -> contains(line, vuid), _SPIRV_VAL_IGNORED_VUIDS)
+                        !any(vuid -> contains(line, vuid), _SPIRV_VAL_IGNORED_VUIDS) &&
+                        !any(msg -> contains(line, msg), _SPIRV_VAL_IGNORED_MESSAGES)
                 end
                 isempty(real_errors) && return  # all errors are known-acceptable
                 # Get disassembly for debugging
@@ -49,10 +53,25 @@ function _validate_spirv(spirv_bytes::Vector{UInt8})
                     try read(`$dis_exe --raw-id $spv_path`, String) catch; "" end
                 end
                 dis_lines = split(dis, '\n')
-                dis_tail = join(last(dis_lines, 40), '\n')
+                # Extract error line numbers and show context around them
+                err_context = String[]
+                for err_line in real_errors
+                    m = match(r"line (\d+)", err_line)
+                    if m !== nothing
+                        ln = parse(Int, m.captures[1])
+                        start_ln = max(1, ln - 10)
+                        end_ln = min(length(dis_lines), ln + 5)
+                        push!(err_context, "--- Around line $ln ---")
+                        for k in start_ln:end_ln
+                            prefix = k == ln ? ">>>" : "   "
+                            push!(err_context, "$prefix $k: $(dis_lines[k])")
+                        end
+                    end
+                end
+                context_str = isempty(err_context) ? join(last(dis_lines, 40), '\n') : join(err_context, '\n')
                 error("SPIR-V validation failed — refusing to create pipeline (would segfault driver).\n",
                       "spirv-val errors:\n", join(real_errors, '\n'), "\n\n",
-                      "Disassembly (last 40 lines):\n$dis_tail")
+                      "Disassembly context:\n$context_str")
             end
         end
     end
@@ -69,6 +88,11 @@ function get_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String,
     cached = get(_pipeline_cache, key, nothing)
     if cached !== nothing
         return cached
+    end
+
+    # Save SPIR-V for debugging if requested
+    if get(ENV, "ABACUS_SAVE_IR", "") == "1"
+        write("/tmp/abacus_debug_fixed.spv", spirv_bytes)
     end
 
     # Validate SPIR-V before sending to driver to prevent segfaults

@@ -144,3 +144,22 @@ end
 @shared_device_override @inline function Base.leading_zeros(x::Int64)
     Base.leading_zeros(reinterpret(UInt64, x))
 end
+
+# ── StaticArrays MArray: avoid pointer bitcasts for SPIR-V ────────────────
+# MArray's getindex/setindex! use pointer_from_objref + unsafe_convert(Ptr{T}, ...)
+# which generates LLVM bitcast → SPIR-V OpBitcast on Function pointers.
+# RADV's ACO can't handle the resulting nir_deref_cast chains (store_deref unimplemented).
+# Override with tuple field access that compiles to clean SPIR-V (OpAccessChain).
+
+using StaticArrays: MArray, StaticArray, check_array_parameters
+
+@shared_device_override @inline function Base.getindex(v::MArray{S,T,N,L}, i::Int) where {S,T,N,L}
+    @boundscheck checkbounds(v, i)
+    return getfield(getfield(v, :data), i)
+end
+
+@shared_device_override @inline function Base.setindex!(v::MArray{S,T,N,L}, val, i::Int) where {S,T,N,L}
+    @boundscheck checkbounds(v, i)
+    setfield!(v, :data, Base.setindex(getfield(v, :data), convert(T, val), i))
+    return v
+end

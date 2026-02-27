@@ -134,7 +134,77 @@ function _vk_reduce_kernel(f::F, op::OP,
     return nothing
 end
 
+"""
+Partial reduction kernel: reduce along selected dimensions using CartesianIndices.
+
+Mirrors AMDGPU's `partial_mapreduce_device`. Each workgroup handles one element
+from the "other" (non-reduced) dimensions and collaboratively reduces across
+the "reduce" dimensions using shared memory tree reduction.
+
+`Rreduce` and `Rother` are CartesianIndices that decompose the input domain:
+- `Rother` covers the output dimensions (each element = one output slot)
+- `Rreduce` covers the dimensions being reduced
+- `max(Iother, Ireduce)` recombines them into a full input index
+
+`R` has an extra trailing dimension for multi-pass support (size 1 for single-pass,
+`reduce_groups` for multi-pass).
+"""
+function _vk_partial_reduce_kernel(f::F, op::OP, neutral::T,
+                                    Rreduce::RR, Rother::RO,
+                                    R::RA, A::AA,
+                                    ::Val{WGS}, ::Val{MAX_ITERS}) where {F, OP, T, RR, RO, RA, AA, WGS, MAX_ITERS}
+    shared = vk_localmemory(T, Val(WGS))
+
+    lid = vk_local_invocation_id_x()       # 0-indexed
+    gid = vk_workgroup_id_x() + UInt32(1)  # 1-indexed
+    ngroups = vk_num_workgroups_x()
+    wgs = UInt32(WGS)
+
+    other_len = UInt32(length(Rother))
+
+    # Decompose workgroup index: inner = other, outer = reduce
+    # Matches AMDGPU's fldmod1(workgroupIdx().x, length(Rother))
+    groupIdx_other  = ((gid - UInt32(1)) % other_len) + UInt32(1)
+    groupIdx_reduce = ((gid - UInt32(1)) ÷ other_len) + UInt32(1)
+    groupDim_reduce = ngroups ÷ other_len
+
+    @inbounds if groupIdx_other <= other_len
+        Iother = Rother[groupIdx_other]
+
+        # Output index includes trailing reduce-group dimension
+        Iout = CartesianIndex(Tuple(Iother)..., groupIdx_reduce)
+
+        val = op(neutral, neutral)
+
+        # Grid-stride reduction with bounded iteration count
+        ireduce = lid + UInt32(1) + (groupIdx_reduce - UInt32(1)) * wgs
+        reduce_len = UInt32(length(Rreduce))
+        stride = wgs * groupDim_reduce
+
+        for _ in UInt32(1):UInt32(MAX_ITERS)
+            if ireduce <= reduce_len
+                Ireduce = Rreduce[ireduce]
+                J = max(Iother, Ireduce)
+                val = op(val, f(A[J]))
+            end
+            ireduce += stride
+        end
+
+        # Workgroup tree reduction
+        result = _reduce_workgroup(op, val, neutral, shared, lid, Val(WGS))
+
+        # First thread writes workgroup result
+        if lid == UInt32(0)
+            R[Iout] = result
+        end
+    end
+
+    return nothing
+end
+
 ## COV_EXCL_STOP
+
+# ── Full reduction (existing optimized 1D kernel) ──
 
 """
     _gpu_full_reduce!(f, op, R::VkArray{T}, A::VkArray, init) -> R
@@ -169,15 +239,13 @@ function _gpu_full_reduce!(f, op, R::VkArray{T}, A::VkArray, init) where T
     return R
 end
 
-"""Compile (cached) and dispatch the reduction kernel."""
+"""Compile (cached) and dispatch the full reduction kernel."""
 function _dispatch_reduce!(f, op, A::VkArray{S}, R::VkArray{T},
                            n::UInt32, neutral::T,
                            wgs::Int, ngroups::Int) where {S, T}
-    # Compute max iterations for grid-stride loop (compile-time constant)
     total_threads = wgs * ngroups
     max_iters = cld(Int(n), total_threads)
 
-    # Build argument tuple matching _vk_reduce_kernel signature
     kernel_args = (f, op,
                    device_address(A), device_address(R),
                    n, neutral, Val(wgs), Val(max_iters), Val(S))
@@ -194,7 +262,84 @@ function _dispatch_reduce!(f, op, A::VkArray{S}, R::VkArray{T},
     end
 end
 
-# --- GPUArrays.mapreducedim! implementation ---
+# ── Partial reduction (general CartesianIndex-based kernel) ──
+
+"""
+    _gpu_partial_reduce!(f, op, R::VkArray{T}, A, init) -> R
+
+General partial reduction using CartesianIndices decomposition.
+Handles partial reductions along arbitrary dimensions and Broadcasted inputs.
+Mirrors AMDGPU's mapreducedim! strategy.
+"""
+function _gpu_partial_reduce!(f, op, R::VkArray{T}, A, init) where T
+    if init === nothing
+        neutral = GPUArrays.neutral_element(op, T)
+    else
+        neutral = convert(T, init)
+    end
+
+    # Add singleton dimensions if needed
+    if ndims(R) < ndims(A)
+        dims = Base.fill_to_length(size(R), 1, Val(ndims(A)))
+        R = reshape(R, dims)
+    end
+
+    # Split iteration domain: reduce × other = all
+    Rall = CartesianIndices(axes(A))
+    Rother = CartesianIndices(axes(R))
+    Rreduce = CartesianIndices(ifelse.(axes(A) .== axes(R), Ref(Base.OneTo(1)), axes(A)))
+    @assert length(Rall) == length(Rother) * length(Rreduce)
+
+    # Add trailing dimension for multi-pass support
+    R′ = reshape(R, (size(R)..., 1))
+
+    # Workgroup size: power of 2, capped at REDUCE_WGS
+    wgs = min(nextpow(2, length(Rreduce)), REDUCE_WGS)
+    wgs = max(wgs, 1)
+
+    # Cap reduction groups to keep second pass small
+    reduce_groups = min(cld(length(Rreduce), wgs), 64)
+
+    if reduce_groups == 1
+        _dispatch_partial_reduce!(f, op, neutral, Rreduce, Rother, R′, A, wgs, 1)
+    else
+        partial = similar(R, (size(R)..., reduce_groups))
+        GC.@preserve partial begin
+            _dispatch_partial_reduce!(f, op, neutral, Rreduce, Rother, partial, A, wgs, reduce_groups)
+            # Second pass: reduce partial results along the trailing dimension
+            GPUArrays.mapreducedim!(identity, op, R′, partial; init=neutral)
+        end
+    end
+
+    return R
+end
+
+"""Compile (cached) and dispatch the partial reduction kernel."""
+function _dispatch_partial_reduce!(f, op, neutral::T, Rreduce, Rother,
+                                    R::VkArray, A,
+                                    wgs::Int, reduce_groups::Int) where T
+    ngroups = reduce_groups * length(Rother)
+    max_iters = max(1, cld(length(Rreduce), wgs * reduce_groups))
+
+    # Convert arrays for device-side indexing (VkArray → VkDeviceArray)
+    R_dev = kernel_convert_ka(R)
+    A_dev = kernel_convert_ka(A)
+
+    args = (f, op, neutral, Rreduce, Rother, R_dev, A_dev,
+            Val(wgs), Val(max_iters))
+    tt = Tuple{map(Core.Typeof, args)...}
+
+    kernel = vkfunction(_vk_partial_reduce_kernel, tt;
+                        workgroup_size=(wgs, 1, 1))
+    bda_data, arg_buf = _pack_and_upload_args(args, kernel.arg_buffer_size)
+
+    groups = (ngroups, 1, 1)
+    GC.@preserve R A begin
+        vk_dispatch!(kernel.pipeline, bda_data, groups)
+    end
+end
+
+# ── GPUArrays.mapreducedim! implementation ──
 
 function GPUArrays.mapreducedim!(f, op, R::VkArray{T},
                                  A::Union{VkArray, Base.Broadcast.Broadcasted};
@@ -202,13 +347,31 @@ function GPUArrays.mapreducedim!(f, op, R::VkArray{T},
     Base.check_reducedims(R, A)
     length(A) == 0 && return R
 
-    # GPU path: full reduction of VkArray input (R is scalar-sized)
+    # Fast path: full reduction of VkArray input (optimized 1D kernel)
     if A isa VkArray && prod(size(R)) == 1
         return _gpu_full_reduce!(f, op, R, A, init)
     end
 
-    # Partial reductions and Broadcasted inputs — not yet implemented on GPU.
-    # TODO: implement a general GPU partial-reduction kernel with CartesianIndex support.
-    error("Partial reductions and Broadcasted inputs not yet supported on VulkanBackend. " *
-          "Only full reductions (scalar output) of VkArray inputs are supported.")
+    # General path: partial reductions and/or Broadcasted inputs
+    return _gpu_partial_reduce!(f, op, R, A, init)
 end
+
+# ── CPU fallback for findfirst/findlast ──
+# GPU findfirst/findlast uses partial reduce with Tuple{Bool, Int64} which
+# generates OpConvertPtrToU on workgroup pointers (illegal in Vulkan SPIR-V).
+# The full reduce path works (via _gpu_full_reduce!), but partial reduce
+# doesn't because struct-field GEPs aren't fully merged in that kernel.
+# Fall back to CPU for now; fix requires deeper LLVM IR fixup for partial reduce.
+
+function Base.findfirst(f::Function, A::VkArray)
+    cpu_arr = Array(A)
+    return findfirst(f, cpu_arr)
+end
+
+function Base.findlast(f::Function, A::VkArray)
+    cpu_arr = Array(A)
+    return findlast(f, cpu_arr)
+end
+
+Base.findfirst(A::VkArray{Bool}) = findfirst(identity, A)
+Base.findlast(A::VkArray{Bool}) = findlast(identity, A)

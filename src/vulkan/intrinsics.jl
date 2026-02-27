@@ -86,12 +86,12 @@ end
 
 # ── Synchronization ───────────────────────────────────────────────────
 
-# NOTE: The Itanium-mangled __spirv_ControlBarrier / __spirv_MemoryBarrier names
-# do NOT work with the Vulkan SPIR-V target (llc leaves them as unresolved function
-# declarations requiring Linkage capability). Only the llvm.spv.* intrinsics work.
-# The only available barrier is @llvm.spv.group.memory.barrier.with.group.sync which
-# hardcodes SequentiallyConsistent semantics. _fix_barrier_semantics! in spirv_fixup.jl
-# patches these to AcquireRelease|WorkgroupMemory in the binary SPIR-V output.
+# NOTE: The llvm.spv.* intrinsic is specific to the LLVM SPIR-V Backend (llc).
+# When using SPIRV-LLVM-Translator (llvm-spirv), _replace_llvm_spv_intrinsics!
+# in compilation.jl replaces these calls with __spirv_ControlBarrier at the
+# LLVM IR level before passing to the translator.
+# The barrier semantics (SequentiallyConsistent) are patched to
+# AcquireRelease|WorkgroupMemory by fix_barrier_semantics! in spirv_fixup.jl.
 
 @inline function vk_workgroup_barrier()
     Base.llvmcall(("""
@@ -177,26 +177,38 @@ function _llvm_type_str(::Type{T}) where T
     T === Float16 && return "half"
     T === Float32 && return "float"
     T === Float64 && return "double"
+    T === Bool && return "i8"
     isprimitivetype(T) && return "i$(8*sizeof(T))"
     error("_llvm_type_str: unsupported type $T")
 end
 
-# Compute the LLVM scalar type and flat array length for a shared memory global.
+# Convert a Julia type to its LLVM IR struct type string.
+# Handles nested structs recursively (e.g. Tuple{Tuple{Float32, Int32}, Int64}).
+function _llvm_composite_type_str(::Type{T}) where T
+    (isprimitivetype(T) || T === Bool) && return _llvm_type_str(T)
+    nf = fieldcount(T)
+    nf == 0 && return "i$(8*sizeof(T))"
+    fields = String[]
+    for i in 1:nf
+        push!(fields, _llvm_composite_type_str(fieldtype(T, i)))
+    end
+    return "{ " * join(fields, ", ") * " }"
+end
+
+# Compute the LLVM type and array length for a shared memory global.
 #
-# The LLVM SPIR-V backend (llc) crashes on nested array/struct types in
-# workgroup storage (addrspace 3). The crash occurs in 'SPIRV legalize
-# bitcast pass' when load/store types don't match the GEP result type
-# (e.g., `store float` to a `[2 x float]*`).
-#
-# Strategy: ALWAYS use flat scalar arrays.
+# Strategy:
 #  - Primitives: [len x T_llvm]  (e.g., [256 x float])
 #  - Homogeneous composites: flatten to [len * nfields x scalar_llvm]
 #    e.g., Vec2f{Float32,Float32} with len=256 → [512 x float]
-#  - Heterogeneous: flatten to [len * sizeof(T)/4 x i32]
+#  - Heterogeneous composites: use LLVM struct type [len x { field_types... }]
+#    llvm-spirv handles struct types in workgroup storage correctly.
 #
 # The _fix_shared_geps! pass in compilation.jl rewrites SRoA-decomposed GEPs
 # (which use [nfields x scalar] as source type) into flat-array GEPs with
 # index arithmetic: flat_idx = elem_idx * nfields + field_idx.
+# For struct-typed elements, a separate pass merges struct-field GEPs into
+# multi-index array GEPs from the global variable.
 #
 # Recursively find the leaf primitive type of a composite.
 # Returns the primitive type if all leaves are the same, or `nothing` if mixed.
@@ -219,7 +231,7 @@ function _leaf_scalar_type(::Type{T}) where T
     return leaf
 end
 
-# Returns (scalar_llvm_type::String, flat_length::Int)
+# Returns (element_llvm_type::String, array_length::Int)
 function _shared_flat_info(::Type{T}, len::Int) where T
     if isprimitivetype(T) || T === Bool
         return (_llvm_type_str(T), len)
@@ -238,10 +250,11 @@ function _shared_flat_info(::Type{T}, len::Int) where T
         @assert n_scalars * sizeof(leaf) == sizeof(T) "Size mismatch for $T"
         return (_llvm_type_str(leaf), len * n_scalars)
     else
-        # Heterogeneous leaves: use i32 (4 bytes) as universal flat element
-        n_i32 = sizeof(T) ÷ 4
-        @assert n_i32 * 4 == sizeof(T) "Shared memory type $T size not a multiple of 4"
-        return ("i32", len * n_i32)
+        # Heterogeneous composites: use LLVM struct type directly.
+        # llvm-spirv handles struct types in workgroup storage correctly,
+        # and _fix_shared_geps! merges struct-field GEPs into multi-index
+        # array GEPs (avoiding OpInBoundsPtrAccessChain which requires Addresses).
+        return (_llvm_composite_type_str(T), len)
     end
 end
 
